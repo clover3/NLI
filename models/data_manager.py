@@ -1,6 +1,6 @@
 import json
 import random
-import re
+
 
 LABEL_MAP = {
     "entailment": 0,
@@ -9,17 +9,23 @@ LABEL_MAP = {
     "hidden": -1
 }
 
+
 def label2sym(label):
-    D = {0:"E",
-    1:"N",
-    2:"C"}
+    """Return label to symbol."""
+    D = {
+        0: "E",
+        1: "N",
+        2: "C"
+        }
     return D[label]
 
 
 def load_nli_data(path, snli=False, shuffle=True):
     """
     Load MultiNLI or SNLI data.
-    If the "snli" parameter is set to True, a genre label of snli will be assigned to the data.
+
+    If the "snli" parameter is set to True, a genre label of snli will be
+    assigned to the data.
     """
     data = []
     with open(path, encoding='utf-8') as f:
@@ -38,13 +44,16 @@ def load_nli_data(path, snli=False, shuffle=True):
     # data is list of dict
     return data
 
-def load_nli_data_genre(path, genre, snli=True, shuffle = True):
-    """
-    Load a specific genre's examples from MultiNLI, or load SNLI data and assign a "snli" genre to the examples.
-    If the "snli" parameter is set to True, a genre label of snli will be assigned to the data. If set to true, it will overwrite the genre label for MultiNLI data.
+
+def load_nli_data_genre(path, genre, snli=True, shuffle=True):
+    """Load the genre of NLI data.
+
+    Load a specific genre's examples from MultiNLI, or load SNLI data and
+    assign a "snli" genre to the examples. If the "snli" parameter is set to
+    True, a genre label of snli will be assigned to the data. If set to true,
+    it will overwrite the genre label for MultiNLI data.
     """
     data = []
-    j = 0
     with open(path) as f:
         for line in f:
             loaded_example = json.loads(line)
@@ -61,8 +70,10 @@ def load_nli_data_genre(path, genre, snli=True, shuffle = True):
     return data
 
 
+"""
 def worker(shared_content, dataset):
     def tokenize(string):
+        import re
         string = re.sub(r'\(|\)', '', string)
         return string.split()
 
@@ -72,8 +83,8 @@ def worker(shared_content, dataset):
 
         s1_token_exact_match = [0] * len(s1_tokenize)
         s2_token_exact_match = [0] * len(s2_tokenize)
-        s1_token_antonym = [0] * len(s1_tokenize)
-        s2_token_antonym = [0] * len(s2_tokenize)
+        # s1_token_antonym = [0] * len(s1_tokenize)
+        # s2_token_antonym = [0] * len(s2_tokenize)
         for i, word in enumerate(s1_tokenize):
             matched = False
             for j, w2 in enumerate(s2_tokenize):
@@ -89,3 +100,4 @@ def worker(shared_content, dataset):
         shared_content[example["pairID"]] = content
         # print(shared_content[example["pairID"]])
         # print(shared_content)
+"""

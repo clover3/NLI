@@ -97,6 +97,7 @@ def load_embedding(word_indices, word_embedding_dimension, divident=1.0):
 
     # Explicitly assign embedding of <PAD> to be zeros.
     emb[0, :] = np.zeros((1, m), dtype="float32")
+    emb[1, :] = np.zeros((1, m), dtype="float32")
     count=0
     with open(path, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
@@ -157,7 +158,22 @@ def highway_layer(x, size, activation, name, carry_bias=-1.0):
         y = tf.add(tf.multiply(H, T), tf.multiply(x, C), name='y') # y = (H * T) + (x * C)
         return y
 
+def init_highway(x, activation, high_param, name):
+    W_, b_, W_T, b_T = high_param
+    with tf.variable_scope(name):
+        W = tf.Variable(W_, "{}/W".format(name))
+        b = tf.Variable(b_, "{}/b".format(name))
 
+        with tf.variable_scope('transform_gate'):
+            W_T = tf.Variable(W_T, "{}/W_T".format(name))
+            b_T = tf.Variable(b_T, "{}/b_T".format(name))
+
+        H = activation(tf.matmul(x, W) + b, name='activation')  # [batch, out_size]
+        T = tf.sigmoid(tf.matmul(x, W_T) + b_T, name='transform_gate')
+        C = 1.0 - T
+
+        y = tf.add(tf.multiply(H, T), tf.multiply(x, C), name='y') # y = (H * T) + (x * C)
+        return y
 
 def seq_xw_plus_b(x, W, b):
     input_shape = tf.shape(x)
@@ -204,7 +220,7 @@ def interaction_feature(a,b, axis):
     return f_concat, f_sub, f_odot
 
 
-def dense(input, input_size, output_size, l2_loss, name):
+def dense(input, input_size, output_size, name):
     with tf.variable_scope(name):
         W = tf.get_variable(
             "W",
@@ -212,9 +228,18 @@ def dense(input, input_size, output_size, l2_loss, name):
             regularizer=tf.contrib.layers.l2_regularizer(scale=0.1),
             initializer=tf.contrib.layers.xavier_initializer())
         b = tf.Variable(tf.constant(0.01, shape=[output_size]), name="b")
-        l2_loss += tf.nn.l2_loss(W)
         output = tf.nn.xw_plus_b(input, W, b)  # [batch, num_class]
         return output
+
+
+def init_dense(input, param, name):
+    W_, b_ = param
+    with tf.variable_scope(name):
+        W = tf.Variable(W_)
+        b = tf.Variable(b_)
+        output = tf.nn.xw_plus_b(input, W, b)  # [batch, num_class]
+        return output
+
 
 def cartesian(v1, v2):
     # [d1] [d2], -> [d1,d2] [d2,d1]
@@ -227,11 +252,11 @@ def cartesian(v1, v2):
     return tf.matmul(v1_flat, v2_flat) # [batch*seq, d1, d1]
 
 
-def factorization_machine(input, n_item, input_size, l2_loss, name):
+def factorization_machine(input, input_size, name):
     # input : [ -1, input_size]
-    hidden_dim = 99
+    hidden_dim = args.fm_latent
     with tf.variable_scope(name):
-        L = tf.reshape(dense(input, input_size, 1, l2_loss, "w"), [-1]) # [batch*seq]
+        L = tf.reshape(dense(input, input_size, 1, "w"), [-1]) # [batch*seq]
 
         v = tf.get_variable(
             "v",
@@ -282,4 +307,15 @@ def LSTM_pool(input, max_seq, input_len, dim, dropout_keep_prob, name):
     return tf.reshape(tf.concat([max_pooled, avg_pooled], axis=2),[-1, dim*2], name="encode_{}".format(name))
 
 
+def multiply_layer(h, in_dim, out_dim, multi_dim, l2_loss):
+    with tf.variable_scope("multiply_layer"):
+        multi_factor = dense(h, in_dim, multi_dim, l2_loss, "multiply_factor") # [batch, multi_dim]
 
+        multi_tile = tf.transpose(tf.reshape(tf.tile(multi_factor, [1,in_dim]), [-1, multi_dim, in_dim]), [0,2,1])
+        print_shape("multi_tile", multi_tile)
+        h_tile = tf.reshape(tf.tile(h, [1, multi_dim]), [-1, in_dim, multi_dim])
+
+        prod = tf.reshape(tf.multiply(h_tile, multi_tile), [-1, in_dim* multi_dim])
+        out = dense(prod, in_dim*multi_dim, out_dim, l2_loss, "multi_dense")
+        print_shape("multiply_layer out ", out)
+        return out

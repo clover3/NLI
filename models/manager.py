@@ -1,5 +1,6 @@
 from tensorflow.python.client import device_lib
 
+from scipy.stats import pearsonr
 from models.CAFE import *
 from util import *
 from collections import Counter
@@ -9,6 +10,9 @@ from tensorflow.python.client import timeline
 from deepexplain.tensorflow import DeepExplain
 from models import adverserial
 from random import shuffle
+from models.entangle import *
+import math
+from scipy.stats import chisquare
 
 def get_summary_path(name):
     i = 0
@@ -19,6 +23,15 @@ def get_summary_path(name):
         i += 1
 
     return gen_path()
+
+def get_run_id():
+    i = 0
+    def gen_path():
+        return os.path.join('summary', '{}{}'.format("train", i))
+
+    while os.path.exists(gen_path()):
+        i += 1
+    return i-1
 
 
 class Manager:
@@ -36,28 +49,29 @@ class Manager:
         self.filters = []
 
         self.num_classes = num_classes
-        self.hidden_size = 200
         self.vocab_size = vocab_size
         self.sent_crop_len = 100
 
         self.embedding_size = embedding_size
         self.max_seq = max_sequence
         self.lstm_dim = lstm_dim
-        self.reg_constant = 1e-5
-        self.lr = 3e-4
+        self.reg_constant = 3e-5
+        self.lr = args.learning_rate
+        print("learning rate : {}".format(self.lr))
+        print("Reg lambda = {}".format(self.reg_constant))
+        print("FM size= {}".format(args.fm_latent))
 
         self.W = None
         self.word_indice = word_indice
 
-        self.l2_loss = 0
-
         self.train_op = None
         config = tf.ConfigProto(allow_soft_placement=True,
-                                  log_device_placement=True )
+                                  log_device_placement=False )
         config.gpu_options.allow_growth = True
         self.sess = tf.Session(config=config)
 
-        with tf.device('/gpu:0'):
+        with tf.device('/cpu:0'):
+            tf.set_random_seed(2)
             self.network()
             self.global_step = tf.Variable(0, name='global_step', trainable=False)
             self.train_op = self.get_train_op()
@@ -83,9 +97,12 @@ class Manager:
         with DeepExplain(session=self.sess, graph=self.sess.graph) as de:
             with tf.name_scope("embedding"):
                 if not os.path.exists("pickle/wemb"):
-                    self.embedding = load_embedding(self.word_indice, self.embedding_size)
+                    wemb = load_embedding(self.word_indice, self.embedding_size)
+
                 else:
-                    self.embedding = tf.Variable(load_pickle("wemb"), trainable=False)
+                    wemb =load_pickle("wemb")
+
+                self.embedding = tf.Variable(wemb, trainable=False)
 
             logits = cafe_network (self.input_p,
                                    self.input_h,
@@ -96,16 +113,16 @@ class Manager:
                                    self.embedding,
                                    self.embedding_size,
                                    self.max_seq,
-                                   self.l2_loss,
                                    self.dropout_keep_prob
                                    )
             self.logits = tf.identity(logits, name="absolute_output")
-            print(self.input_y)
             pred_loss = tf.reduce_mean(
                 tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.input_y, logits=self.logits))
+            pred_loss = tf.clip_by_value(pred_loss, 1e-10, 100.0)
             self.acc = tf.reduce_mean(
                 tf.cast(tf.equal(tf.argmax(self.logits, axis=1),tf.cast(self.input_y, tf.int64)), tf.float32))
             l2_loss = tf.losses.get_regularization_loss()
+            self.l2_loss = self.reg_constant * l2_loss
             self.loss = pred_loss + self.reg_constant * l2_loss
 
         tf.summary.scalar('l2loss', self.reg_constant * l2_loss)
@@ -115,13 +132,179 @@ class Manager:
         return self.loss
 
     def load(self, id):
-        self.saver.restore(self.sess, self.load_path(id))
+        path = self.load_path(id)
+        print("Loading {}".format(path))
+        self.saver.restore(self.sess, path)
 
     def save_path(self):
-        return os.path.join(os.path.abspath("checkpoint"),"hdrop", "model")
+        run_name = "{}".format(get_run_id())
+        return os.path.join(os.path.abspath("checkpoint"), run_name, "model")
 
     def load_path(self, id):
         return os.path.join(os.path.abspath("checkpoint"), id)
+
+    def corr_analysis(self, dev_data, idx2word):
+        feature = tf.get_default_graph().get_tensor_by_name(name="feature:0")
+        _, dim4 = feature.get_shape().as_list()
+        dim = int(dim4 / 4)
+
+        D = {0: "E",
+             1: "N",
+             2: "C"}
+        batch_size = 30
+        dev_batches = get_batches(dev_data, batch_size, 100)
+        results = [self.run_w_feature(batch) for batch in dev_batches]
+        acc_logits, acc_feature = zip(*results)
+        acc_logits = np.concatenate(acc_logits, axis=0)
+        acc_feature = np.concatenate(acc_feature, axis=0)
+
+        def one_hot(batch):
+            p, p_len, h, h_len, y = batch
+
+            fv_list = []
+            for i in range(len(p_len)):
+                prem_tokens = set([idx2word[idx] for idx in p[i,:]])
+                hypo_tokens = set([idx2word[idx] for idx in h[i,:]])
+                fv = np.zeros([15])
+                for w_no, word in enumerate(["no", "nothing", "never", "not", "n't"]):
+                    if word in prem_tokens:
+                        fv[w_no*3] = 1
+                    if word in hypo_tokens:
+                        fv[w_no*3+1] = 1
+                    if word in prem_tokens or word in hypo_tokens:
+                        fv[w_no*3+2] = 1
+                fv_list.append(fv)
+            return np.stack(fv_list)
+
+        acc_fv = np.concatenate([one_hot(batch) for batch in dev_batches], axis=0)
+
+        def chi_test(ce_logits, feature):
+            logit_p = (ce_logits > 0.4)
+            logit_n = np.logical_not(logit_p)
+            prob_logit_p = np.average(logit_p)
+
+
+            feature_avg = np.average(feature)
+            feature_p = (feature > feature_avg)
+            feature_n = np.logical_not(feature_p)
+            prob_feature_p = np.average(feature_p)
+
+            total = len(feature)
+            pp_expected = prob_logit_p * prob_feature_p * total
+            pn_expected = prob_logit_p * (1-prob_feature_p) * total
+            np_expected = (1-prob_logit_p) * prob_feature_p * total
+            nn_expected = (1-prob_logit_p) * (1-prob_feature_p) * total
+
+            pp_actual = np.logical_and(logit_p, feature_p).sum()
+            pn_actual = np.logical_and(logit_p, feature_n).sum()
+            np_actual = np.logical_and(logit_n, feature_p).sum()
+            nn_actual = np.logical_and(logit_n, feature_n).sum()
+            actual_l = [pp_actual, pn_actual, np_actual, nn_actual]
+            expected_l = [pp_expected, pn_expected, np_expected, nn_expected]
+            x2, p = chisquare(actual_l,
+                          expected_l,
+                          ddof=2)
+            if x2 > 3000:
+                print(actual_l, expected_l)
+
+            return x2, feature_avg, pp_actual>pp_expected
+
+
+        corr = []
+        for label in [0,1,2]:
+            raw = [(f, pearsonr(acc_logits[:, label], acc_feature[:, f])) for f in range(dim4)]
+            corr.append(sorted(raw, key=lambda x: x[1][0]))
+
+        stdev = np.std(acc_feature, axis=0)
+        corr_ce = [(f, pearsonr(acc_logits[:, 2]-acc_logits[:,0], acc_feature[:, f])) for f in range(dim4)]
+        corr_ce.sort(key=lambda x: x[1][0])
+        corr_entail = corr[0]
+        corr_neutra = corr[1]
+        corr_contra = corr[2]
+        chi_ce = [(f, chi_test(acc_logits[:, 2]-acc_logits[:,0], acc_feature[:, f])) for f in range(dim4)]
+        chi_ce.sort(key=lambda x: x[1][0], reverse=True)
+        print("Chi square test")
+        for f_id, info in chi_ce[:30]:
+            x2, cut, slope = info
+            print("{} :{}".format(f_id, info))
+        save_pickle("chi_ce", chi_ce[:30])
+        def has_signal(feature_v):
+            for f_id, info in chi_ce[:100]:
+                x2, cut, slope = info
+
+                if slope and feature_v[f_id] > cut:
+                    return True
+                if not slope and feature_v[f_id] < cut:
+                    return True
+            return False
+
+        count_shift = 0
+        count_ex = 0
+        for i in range(len(acc_feature)):
+            p = acc_logits[i, 2] - acc_logits[i, 0] > 0.4
+            if not has_signal(acc_feature[i]):
+                count_ex += 1
+                if p:
+                    count_shift += 1
+
+        print("{} / {} ".format(count_shift, count_ex))
+
+
+        return
+        c_printed = []
+        print("contra - major feature")
+        interest = range(dim4)
+
+        for index in interest:
+            print(corr_contra[index])
+            c_printed.append(corr_contra[index][0])
+
+        e_printed = []
+        print("entail - major feature")
+        for index in interest:
+            print(corr_entail[index])
+            e_printed.append(corr_entail[index][0])
+
+        print("neutral - major feature")
+        for index in interest:
+            print(corr_neutra[index])
+
+        intersection = set(c_printed) & set(e_printed)
+        print("c,e common ")
+        for entry in corr_ce:
+            if entry[0] in intersection:
+                print(entry)
+
+        def region(f):
+            if f < dim:
+                return "premise"
+            elif f < dim*2:
+                return "hypothesis"
+            elif f < dim*3:
+                return "sub"
+            else:
+                return "odot"
+
+        threshold = 1e-8
+        counter = Counter()
+        major_ce = []
+        for i in range(dim4):
+            entry = corr_ce[i]
+            f_id = entry[0]
+            p_value = entry[1][1]
+            n_slope = entry[1][0] / stdev[f_id]
+            if p_value < threshold and abs(n_slope) > 0.4:
+                counter[region(f_id)] += 1
+                major_ce.append(entry)
+                print("fid={} stdev={} raw_slop={}".format(f_id, stdev[f_id], entry[1][0]))
+
+        for key, value in counter.items():
+            print("{} : {}".format(key, value))
+
+
+        corr_f = [((entry[0], fv), pearsonr(acc_feature[:, entry[0]], acc_fv[:, fv])) for entry in major_ce for fv in range(15)]
+        save_pickle("major_ce", major_ce)
+
 
     def view_weights(self, dev_data):
         feature = tf.get_default_graph().get_tensor_by_name(name="feature:0")
@@ -158,7 +341,7 @@ class Manager:
             prem = run_feature[i,0:dim*1]
             hypo = run_feature[i, dim * 1:dim*2]
             sub = run_feature[i,dim*2:dim*3]
-            print("concat*sub/|hypo|:", np.dot(prem,sub)/ np.dot(hypo,hypo))
+            print("concat*sub/|hypo|:", np.dot(hypo,sub)/ np.dot(hypo,hypo))
             print("Concat:",end="")
             for j in range(dim*2):
                 print("{0:.1f} ".format(run_feature[i,j]), end="")
@@ -171,6 +354,41 @@ class Manager:
             for j in range(dim):
                 print("{0:.1f} ".format(run_feature[i,dim*3+j]), end="")
             print()
+
+
+    def run_w_feature(self, batch):
+        feature = tf.get_default_graph().get_tensor_by_name(name="feature:0")
+        p, p_len, h, h_len, y = batch
+        return self.sess.run([tf.nn.softmax(self.logits), feature], feed_dict={
+            self.input_p: p,
+            self.input_p_len: p_len,
+            self.input_h: h,
+            self.input_h_len: h_len,
+            self.input_y: y,
+            self.dropout_keep_prob: 1.0,
+        })
+
+    def run_result(self, batch):
+        p, p_len, h, h_len, y = batch
+        logits, = self.sess.run([self.logits], feed_dict={
+            self.input_p: p,
+            self.input_p_len: p_len,
+            self.input_h: h,
+            self.input_h_len: h_len,
+            self.input_y: y,
+            self.dropout_keep_prob: 1.0,
+        })
+        return logits
+
+    @staticmethod
+    def word(index, idx2word):
+        if index in idx2word:
+            if idx2word[index] == "<PADDING>":
+                return "PADDING"
+            else:
+                return idx2word[index]
+        else:
+            return "OOV"
 
     def view_weights2(self, dev_data):
         pred_high1_w = tf.get_default_graph().get_tensor_by_name(name="pred/high1/weight:0")
@@ -193,6 +411,221 @@ class Manager:
         dev_batches = get_batches(dev_data, batch_size, 100)
         run_logits, pred_high1_w_out, pred_high2_w, pred_dense_w, pred_dense_b = run_result(dev_batches[0])
         print(pred_high1_w_out)
+
+    def lrp_premise(self, dev_data, idx2word):
+        batch_size = 30
+        max_seq = 100
+        PREMISE = 0
+        HYPOTHESIS = 1
+        def word(index):
+            if index in idx2word:
+                if idx2word[index] == "<PADDING>":
+                    return "PADDING"
+                else:
+                    return idx2word[index]
+            else:
+                return "OOV"
+
+
+
+        dev_batches = get_batches(dev_data, batch_size, max_seq)
+        p, p_len, h, h_len, y = dev_batches[0]
+        run_logits = self.run_result(dev_batches[0])
+        enc_prem = tf.get_default_graph().get_tensor_by_name(name="encode_p_lstm:0")
+        _, f_size = enc_prem.get_shape().as_list()
+        p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
+        h_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="hypothesis:0")
+        with DeepExplain(session=self.sess) as de:
+
+            x_input = [self.input_p, self.input_p_len, self.input_h, self.input_h_len, self.dropout_keep_prob]
+            xi = [p, p_len, h, h_len, 1.0]
+            stop = [p_emb_tensor, h_emb_tensor]
+            f_begin = args.frange
+            def evaluate_E():
+                E_list = []
+                end = min(f_begin, f_begin+50)
+                for f in range(f_begin, end):
+                    begin = time.time()
+                    raw_E = de.explain('grad*input', enc_prem[:,f], stop, x_input, xi)
+                    raw_E[PREMISE] = np.sum(raw_E[PREMISE], axis=2)
+                    raw_E[HYPOTHESIS] = np.sum(raw_E[HYPOTHESIS], axis=2)
+                    E_list.append(raw_E)
+                    print("Elapsed={}".format(time.time() - begin))
+                return E_list
+            #E_list = evaluate_E()
+            #save_pickle("lstm_p_f_{}".format(f_begin), E_list)
+            E_list = load_pickle("lstm_p")
+            for b in range(batch_size):
+                entangle_p = np.zeros([p_len[b], p_len[b]])
+                for f in range(f_size):
+                    p_r = E_list[f][PREMISE]
+                    h_r = E_list[f][HYPOTHESIS]
+                    p_r_sum = np.sum(p_r, axis=1)
+
+                    for i1 in range(p_len[b]):
+                        for i2 in range(p_len[b]):
+                            entangle_p[i1, i2] += abs(p_r[b,i1]) * abs(p_r[b,i2])
+                print("Intra")
+                for i1 in range(p_len[b]):
+                    for i2 in range(p_len[b]):
+                        print("{0:.0f}\t".format(100*entangle_p[i1, i2]), end="")
+                    print("")
+                grouping = minimum_entangle(entangle_p)
+                print(grouping.loss_group())
+                group = grouping.group_by_count(int(p_len[b]/2))
+                for begin, end in group:
+                    word_group = []
+                    for i in range(begin,end):
+                        word_group.append(word(p[b,i]))
+                    print("[{}] ".format(" ".join(word_group)), end="")
+                print("")
+
+            return
+
+    def feature_invertor(self, dev_data, idx2word):
+        batch_size = 30
+        max_seq = 100
+        PREMISE = 0
+        HYPOTHESIS = 1
+
+        D = {0: "E",
+             1: "N",
+             2: "C"}
+
+        dev_batches = get_batches(dev_data, batch_size, max_seq)
+        dim = 612
+        major_ce = load_pickle("major_ce")
+        c_features = set([entry[0] for entry in major_ce])
+        def find_feature(f):
+            if f in c_features:
+                for entry in chi_ce:
+                    if entry[0] == f:
+                        return entry[1]
+            else:
+                return None
+        E_list = load_pickle("E_list")
+        chi_ce = load_pickle("chi_ce")
+        c_features = set([entry[0] for entry in chi_ce])
+
+        p, p_len, h, h_len, y = dev_batches[0]
+        run_logits, feature = self.run_w_feature(dev_batches[0])
+        pred = np.argmax(run_logits, axis=1)
+        feature_ce = load_pickle("feature_ce")
+
+        def word_feature_gradient():
+            summary = []
+            for b in range(batch_size):
+                true_label = D[y[b]]
+                pred_label = D[pred[b]]
+                print("--- {}({}) -- {} --- ".format(pred_label, true_label, run_logits[b, :]))
+                prem_r = np.zeros([p_len[b]])
+                hypo_r = np.zeros([h_len[b]])
+                for f in range(612*4):
+                    if f in c_features:
+                        x2, cut, slope = find_feature(f)
+                        p_r = E_list[f][PREMISE]
+                        h_r = E_list[f][HYPOTHESIS]
+                        factor = 0
+                        if slope :
+                            if feature[b,f] > cut :
+                                factor = 1
+                        elif not slope:
+                            if feature[b,f] < cut:
+                                factor = 1
+                        for i_p in range(p_len[b]):
+                            prem_r[i_p] += abs(p_r[b,i_p]) * factor
+                        for i_h in range(h_len[b]):
+                            hypo_r[i_h] += abs(h_r[b,i_h]) * factor
+
+
+                print("premise: " , end = "")
+                p_summary =[]
+                for i_p in range(p_len[b]):
+                    word = self.word(p[b, i_p], idx2word)
+                    score= prem_r[i_p]
+                    if abs(score) > 0.1:
+                        print("{0}({1:.2f})".format(word, score), end=" ")
+                    p_summary.append((word, score))
+                print("")
+                print("Hypo: ", end = "")
+                h_summary = []
+                for i_h in range(h_len[b]):
+                    word = self.word(h[b, i_h], idx2word)
+                    score = hypo_r[i_h]
+                    print("{0}({1:.2f})".format(word, score), end=" ")
+                    h_summary.append((word, score))
+                summary.append((h_summary, p_summary))
+                print("")
+                s1 = np.sum(prem_r)
+                s2 = np.sum(hypo_r)
+                s3 = s1+s2
+                print("Total {}+{}={}".format(s1,s2,s3))
+            save_pickle("ce_lrp", summary)
+        word_feature_gradient()
+        def construct_classification_network(feature):
+            high1_W = tf.get_default_graph().get_tensor_by_name("pred/high1/weight:0")
+            high1_b = tf.get_default_graph().get_tensor_by_name("pred/high1/bias:0")
+            high1_W_T = tf.get_default_graph().get_tensor_by_name("pred/high1/transform_gate/weight:0")
+            high1_b_T = tf.get_default_graph().get_tensor_by_name("pred/high1/transform_gate/bias:0")
+            high1_param = (high1_W, high1_b, high1_W_T, high1_b_T)
+
+            high2_W = tf.get_default_graph().get_tensor_by_name("pred/high2/weight:0")
+            high2_b = tf.get_default_graph().get_tensor_by_name("pred/high2/bias:0")
+            high2_W_T = tf.get_default_graph().get_tensor_by_name("pred/high2/transform_gate/weight:0")
+            high2_b_T = tf.get_default_graph().get_tensor_by_name("pred/high2/transform_gate/bias:0")
+            high2_param = (high2_W, high2_b, high2_W_T, high2_b_T)
+
+            pred_W = tf.get_default_graph().get_tensor_by_name("pred/dense/W:0")
+            pred_b = tf.get_default_graph().get_tensor_by_name("pred/dense/b:0")
+            pred_param = (pred_W, pred_b)
+
+            high1_param, high2_param, pred_param = self.sess.run([high1_param, high2_param, pred_param])
+            logit = feature_classification(feature, high1_param, high2_param, pred_param)
+            return logit
+
+
+
+
+
+    def eval_lrp_feature(self, dev_data):
+
+        batch_size = 30
+        max_seq = 100
+        D = {0: "E",
+             1: "N",
+             2: "C"}
+
+        dev_batches = get_batches(dev_data, batch_size, max_seq)
+        PREMISE = 0
+        HYPOTHESIS = 1
+
+        p, p_len, h, h_len, y = dev_batches[0]
+        feature = tf.get_default_graph().get_tensor_by_name(name="feature:0")
+        _, f_size = feature.get_shape().as_list()
+        # f_size = 100 # debug
+        p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
+        h_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="hypothesis:0")
+
+        with DeepExplain(session=self.sess) as de:
+
+            x_input = [self.input_p, self.input_p_len, self.input_h, self.input_h_len, self.dropout_keep_prob]
+            xi = [p, p_len, h, h_len, 1.0]
+            stop = [p_emb_tensor, h_emb_tensor]
+            f_begin = args.frange
+
+            def evaluate_E():
+                E_list = []
+                for f in range(f_begin, f_begin + 50):
+                    begin = time.time()
+                    raw_E = de.explain('grad*input', feature[:, f], stop, x_input, xi)
+                    raw_E[PREMISE] = np.sum(raw_E[PREMISE], axis=2)
+                    raw_E[HYPOTHESIS] = np.sum(raw_E[HYPOTHESIS], axis=2)
+                    E_list.append(raw_E)
+                    print("Elapsed={}".format(time.time() - begin))
+                return E_list
+
+            E_list = evaluate_E()
+            save_pickle("temp_f_{}".format(f_begin), E_list)
 
     def lrp_entangle(self, dev_data, idx2word):
         batch_size = 30
@@ -229,14 +662,16 @@ class Manager:
 
         p, p_len, h, h_len, y = dev_batches[0]
         run_logits = run_result(dev_batches[0])
+        ce_summary = load_pickle("ce_lrp")
         print_shape("p", p)
         print_shape("p_len", p_len)
         feature = tf.get_default_graph().get_tensor_by_name(name="feature:0")
         _, f_size = feature.get_shape().as_list()
-        f_size = int(f_size/2)
+        _, feature_out = self.run_w_feature(dev_batches[0])
         #f_size = 100 # debug
         p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
         h_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="hypothesis:0")
+
         with DeepExplain(session=self.sess) as de:
 
             x_input = [self.input_p, self.input_p_len, self.input_h, self.input_h_len, self.dropout_keep_prob]
@@ -267,19 +702,89 @@ class Manager:
                         result.append(elem)
                 return result
 
-            E_list = load_E_particle()
+            soft_out = tf.nn.softmax(self.logits)
+            feature_e = de.explain('grad*input', soft_out[:,0], [feature], x_input, xi)
+            feature_c = de.explain('grad*input', soft_out[:,2], [feature], x_input, xi)
 
+            feature_ce = feature_e[0] - feature_c[0]
+            save_pickle("feature_ce", feature_ce)
+
+            #E_list = load_E_particle()
+            E_list = load_pickle("E_list")
             print("f_size : {}".format(f_size))
+            f_begin = 612*2
+            f_end = 612*3
             print("E[0][0].shape: {}".format(E_list[0][PREMISE].shape))
 
+            def softmax(w, t=1.0):
+                e = np.exp(w / t)
+                dist = e / np.sum(e)
+                return dist
+
+
+            def print_table(f, entangle, p_len, h_len, p, h, summary):
+                if summary is not None:
+                    h_summary, p_summary = summary
+                cap = np.max(entangle)
+                def gen_color(v):
+
+                    b = int(255- v/cap * 255)
+                    b = max(255-v*100,0)
+                    return ("%02x" % b) + ("%02x" % b) + "ff"
+
+                def ce_color(v):
+                    v= v*50
+                    if v> 255:
+                        v =255
+                    elif v< -255:
+                        v=-255
+                    b = int(255 - abs(v))
+                    if v >= 0 : # red
+                        return "ff" + ("%02x" % b) + ("%02x" % b)
+                    else:
+                        return ("%02x" % b) + "ff" + ("%02x" % b)
+
+                f.write("<table style=\"border:1px solid\">")
+                f.write("<tr>")
+                f.write("<th></th>")
+                for i in range(h_len):
+                    if summary is not None:
+                        ce_word, ce_val = h_summary[i]
+                        f.write("<th style=\"min-width:35px\" bgcolor=\"#{}\">{}</th>".format(ce_color(ce_val), word(h[i])))
+                        assert (word(h[i]) == ce_word)
+                    else:
+                        f.write("<th style=\"min-width:35px\">{}</th>".format(word(h[i])))
+
+
+
+                f.write("</tr>")
+                for i in range(p_len):
+                    if summary is None:
+                        f.write("<tr>")
+                        f.write("<td>{}</td>".format(word(p[i])))
+                    else:
+                        ce_word, ce_val = p_summary[i]
+                        f.write("<tr>")
+                        f.write("<td bgcolor=\"#{}\">{}</td>".format(ce_color(ce_val), word(p[i])))
+                    for i2 in range(h_len):
+                        f.write("<td bgcolor=\"#{}\"></td>".format(gen_color(entangle[i,i2])))
+                    f.write("</tr>")
+                f.write("</table>")
+
+            logit_array = []
+            pred = np.argmax(run_logits, axis=1)
+            html_f = open("Entangles.html", "w")
+            html_f.write("<html><body>\n")
+            html_f.write("<p><b><font color=\"red\">Red</font><font color=\"green\">/Green</font><b> color in the words implies each words contribution to Contradiction/Entailment</p>\n")
+            html_f.write("<p><b>Blue<b> color in the cell represents degree of interaction between two words.</p>\n")
             for b in range(batch_size):
                 print("-------")
-                pred = np.argmax(run_logits, axis=1)
+
 
                 true_label = D[y[b]]
                 pred_label = D[pred[b]]
-
-                print("--- {}({}) -- {} --- ".format(pred_label, true_label, run_logits[b]))
+                print("--- {}({}) -- {} --- ".format(pred_label, true_label, run_logits[b,:]))
+                logit_array.append(run_logits[b,:])
 
                 entangle = np.zeros([p_len[b], h_len[b]])
                 entangle_p = np.zeros([p_len[b], p_len[b]])
@@ -291,21 +796,45 @@ class Manager:
                         for f in range(f_size):
                             r_i_sum[s][i] += abs(E_list[f][s][b,i])
 
-                for f in range(f_size):
+                for f in range(f_begin, f_end):
                     p_r = E_list[f][PREMISE]
                     h_r = E_list[f][HYPOTHESIS]
+                    p_r_sum = np.sum(p_r, axis=1)
+                    r_f = feature_c[0][b, f] - feature_e[0][b, f]
+                    #factor = math.exp(r_f)
+                    f_i_p = feature_out[b, f-612*2]
+                    f_i_h = feature_out[b, f-612]
+                    if f_i_p == 0.0 and f_i_h == 0.0:
+                        factor = 0
+                    else:
+                        factor = math.exp(-(abs(0.1 * (f_i_h-f_i_p)/(abs(f_i_h)+abs(f_i_p)))))
 
                     for i_p in range(p_len[b]):
                         for i_h in range(h_len[b]):
-                            entangle[i_p, i_h] += abs(p_r[b,i_p]) * abs(h_r[b,i_h])
+                            entangle[i_p, i_h] += factor * abs(p_r[b,i_p]) * abs(h_r[b,i_h])
                     for i1 in range(p_len[b]):
-                        for i2 in range(p_len[b]):
+                           for i2 in range(p_len[b]):
                             entangle_p[i1, i2] += abs(p_r[b,i1]) * abs(p_r[b,i2])
+
+                html_f.write("<h3>Prediction={} True Label={}</h3>".format(pred_label, true_label))
+                print_table(html_f, entangle, p_len[b], h_len[b], p[b,:], h[b,:], ce_summary[b])
+                print_table(html_f, entangle_p, p_len[b], p_len[b], p[b, :], p[b, :], None)
+
                 print("Intra")
                 for i1 in range(p_len[b]):
                     for i2 in range(p_len[b]):
                         print("{0:.0f}\t".format(100*entangle_p[i1, i2]), end="")
                     print("")
+                grouping = minimum_entangle(entangle_p)
+                print(grouping.loss_group())
+                group = grouping.group_by_count(int(p_len[b] * 0.6))
+                for begin, end in group:
+                    word_group = []
+                    for i in range(begin,end):
+                        word_group.append(word(p[b,i]))
+                    print("[{}] ".format(" ".join(word_group)), end="")
+                print("")
+
                 print("Inter")
 
                 for i_p in range(p_len[b]):
@@ -330,6 +859,13 @@ class Manager:
                 print("< hypothesis >")
                 for i_h in range(h_len[b]):
                     print("{0:.0f}\t{1}".format(entangle_m_h[i_h], word(h[b,i_h])))
+
+            e_l, n_l, c_l = zip(*logit_array)
+            print("e-n correlation : {}".format(pearsonr(e_l, n_l)))
+            print("e-c correlation : {}".format(pearsonr(e_l, c_l)))
+            print("n-c correlation : {}".format(pearsonr(n_l, c_l)))
+
+            html_f.write("</body></html>\n")
 
     def lrp_3way(self, dev_data, idx2word):
 
@@ -386,6 +922,9 @@ class Manager:
             E_all = []
             for label in range(3):
                 E_all.append(de.explain('grad*input', soft_out[:, label], stop, x_input, xi))
+
+            major = [[],[],[]]
+            portion = [[],[],[],[],[]]
             for i in range(batch_size):
                 print("-------")
                 pred = np.argmax(run_logits, axis=1)
@@ -393,13 +932,26 @@ class Manager:
                 true_label = D[y[i]]
                 pred_label = D[pred[i]]
 
-
                 print("--- {}({}) -- {} --- ".format(pred_label, true_label, run_logits[i]))
                 for label in range(3):
                     r = E_all[label][0]
-                    r_concat = np.sum(r[i,0:dim*2])
-                    r_sub = np.sum(r[i, dim*2:dim*3])
-                    r_odot = np.sum(r[i, dim*3:dim*4])
+                    r_concat = np.sum(abs(r[i,0:dim*2]))
+                    r_sub = np.sum(abs(r[i, dim*2:dim*3]))
+                    r_odot = np.sum(abs(r[i, dim*3:dim*4]))
+                    r_p = np.sum(abs(r[i,0:dim]))
+                    r_h = np.sum(abs(r[i,dim:dim*2]))
+
+                    if r_concat > r_sub and r_concat > r_odot:
+                        major[label].append("concat")
+                    elif r_sub > r_concat and r_sub > r_odot:
+                        major[label].append("sub")
+                    elif r_odot > r_concat and r_odot > r_sub:
+                        major[label].append("odot")
+                    else:
+                        raise Exception("Unexpected")
+                    r_sum = r_concat + r_sub + r_odot
+                    portion[label].append((r_concat/r_sum, r_sub/r_sum, r_odot/r_sum, r_p/r_sum, r_h/r_sum))
+
                     print(D[label])
                     print("concat {0:.2f} ".format(r_concat))
                     for j in range(0,200):
@@ -417,6 +969,16 @@ class Manager:
                     #for j in range(dim):
                     #    print("{0:.2f}".format(r[i,j]), end=" ")
                     #print("")
+
+            for label in range(3):
+                print(D[label])
+                for operation in ["concat", "sub", "odot"]:
+                    print("{} : {}".format(operation, major[label].count(operation)/batch_size))
+                for portion_list in zip(*portion[label]):
+                    print("{}".format(avg(portion_list)))
+
+
+
 
     def manaual_test(self, word2idx, idx2word):
         h1 = "It 's an interesting account of the violent history of modern Israel , and ends in the  Room where nine Jews were executed . "
@@ -532,8 +1094,8 @@ class Manager:
 
         print("view lrp")
         dev_batches = get_batches(dev_data, 100, 100)
-        p, p_len, h, h_len, y = dev_batches[0]
-        run_logits = run_result(dev_batches[0])
+        p, p_len, h, h_len, y = dev_batches[2]
+        run_logits = run_result(dev_batches[2])
         print_shape("p", p)
         print_shape("p_len", p_len)
         p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
@@ -559,15 +1121,16 @@ class Manager:
             xi = [p, p_len, h, h_len, 1.0]
             yi = expand_y(y)
             stop = [p_emb_tensor, h_emb_tensor]
+            soft_out = tf.nn.softmax(self.logits)
 
-            c_e = self.logits[:, 2] - self.logits[:, 0]
-            e_n = self.logits[:, 0] - self.logits[:, 1]
-            C_E = de.explain('elrp', c_e , stop, x_input, xi)
-            E_N = de.explain('elrp', e_n, stop, x_input, xi)
+            c_e = soft_out[:, 2] - soft_out[:, 0]
+            e_n = soft_out[:, 0] - soft_out[:, 1]
+            C_E = de.explain('grad*input', c_e , stop, x_input, xi)
+            E_N = de.explain('grad*input', e_n, stop, x_input, xi)
 
             E_all = []
             for label in range(3):
-                E_all.append(de.explain('grad*input', self.logits[:, label], stop, x_input, xi))
+                E_all.append(de.explain('grad*input', soft_out[:, label], stop, x_input, xi))
 
             print("result----------")
             pred = np.argmax(run_logits, axis=1)
@@ -591,6 +1154,8 @@ class Manager:
                 _, max_seq, _ = p_r.shape
                 p_r_s = np.sum(p_r[i], axis=1)
                 h_r_s = np.sum(h_r[i], axis=1)
+                p_c_e_s = np.sum(C_E[0][i], axis=1)
+                h_c_e_s = np.sum(C_E[1][i], axis=1)
 
 
                 f.write("<html>")
@@ -600,9 +1165,19 @@ class Manager:
                 print("premise: ")
                 r_max = max([np.max(E_sum[label][s]) for label in range(3) for s in range(0,1)])
                 r_min = min([np.min(E_sum[label][s]) for label in range(3) for s in range(0,1)])
+                ce_max = max(np.max(p_c_e_s), -np.min(p_c_e_s))
+                ce_min = -ce_max
                 for j in range(max_seq):
-                    print("{0}({1:.2f})".format(word(p[i,j]), p_r_s[j]), end=" ")
-                    f.write(print_color_html(word(p[i,j]), E_sum[0][0][j], E_sum[1][0][j], E_sum[2][0][j], r_max, r_min))
+                    print("{0}({1:.2f},{2:.2f})".format(word(p[i,j]), p_r_s[j], p_c_e_s[j]), end=" ")
+                    #f.write(print_color_html(word(p[i,j]), E_sum[0][0][j], E_sum[1][0][j], E_sum[2][0][j], r_max, r_min))
+                    v = p_c_e_s[j]
+                    if v > 0:
+                        r = v
+                        b = 0
+                    else:
+                        r = 0
+                        b = -v
+                    f.write(print_color_html(word(p[i,j]), r, b, 0, ce_max, ce_min))
 
                 print()
                 _, max_seq, _ = h_r.shape
@@ -610,9 +1185,19 @@ class Manager:
                 print("hypothesis: ")
                 r_max = max([np.max(E_sum[label][s]) for label in range(3) for s in range(1, 2)])
                 r_min = min([np.min(E_sum[label][s]) for label in range(3) for s in range(1, 2)])
+                ce_max = max(np.max(h_c_e_s), -np.min(h_c_e_s))
+                ce_min = -ce_max
                 for j in range(max_seq):
-                    print("{0}({1:.2f})".format(word(h[i,j]), h_r_s[j]), end=" ")
-                    f.write(print_color_html(word(h[i,j]), E_sum[0][1][j], E_sum[1][1][j], E_sum[2][1][j], r_max, r_min))
+                    print("{0}({1:.2f},{2:.2f})".format(word(h[i,j]), h_r_s[j], h_c_e_s[j]), end=" ")
+                    #f.write(print_color_html(word(h[i,j]), E_sum[0][1][j], E_sum[1][1][j], E_sum[2][1][j], r_max, r_min))
+                    v = h_c_e_s[j]
+                    if v > 0:
+                        r = v
+                        b = 0
+                    else:
+                        r = 0
+                        b = -v
+                    f.write(print_color_html(word(h[i,j]), r, b, 0, ce_max, ce_min))
                 print()
                 f.write("</div><hr>")
             f.write("</html>")
@@ -623,6 +1208,24 @@ class Manager:
         ctf = tl.generate_chrome_trace_format()
         with open('timeline.json', 'w') as f:
             f.write(ctf)
+
+    def check_dev_plain(self, dev_data):
+        dev_batches = get_batches(dev_data, 30, 100)
+        acc_sum = []
+
+        for batch in dev_batches:
+            p, p_len, h, h_len, y = batch
+            acc, loss, summary = self.sess.run([self.acc, self.loss, self.merged], feed_dict={
+                self.input_p: p,
+                self.input_p_len: p_len,
+                self.input_h: h,
+                self.input_h_len: h_len,
+                self.input_y: y,
+                self.dropout_keep_prob: 1.0,
+            })
+            acc_sum.append(acc)
+        print("Dev acc={} ".format(avg(acc_sum)))
+
 
     def check_dev(self, batches, g_step):
         acc_sum = []
@@ -642,18 +1245,22 @@ class Manager:
             loss_sum.append(loss)
             self.test_writer.add_summary(summary, g_step+step)
             step += 1
-
-        print("Dev acc={} loss={} ".format(avg(acc_sum), avg(loss_sum)))
+        acc = avg(acc_sum)
+        if acc > self.best_acc:
+            self.best_acc = acc
+        print("Dev acc={} loss={} ".format(acc, avg(loss_sum)))
 
     def train(self, epochs, data, valid_data, rerun=False):
         print("Train")
         self.log_info()
+        self.best_acc = 0
         if not rerun:
             self.sess.run(tf.global_variables_initializer())
         batches = get_batches(data, self.batch_size, self.sent_crop_len)
-        dev_batches = get_batches(valid_data, 200, self.sent_crop_len)
+        dev_batch_size = 200
+        dev_batches = get_batches(valid_data, dev_batch_size, self.sent_crop_len)
         step_per_batch = int(len(data) / self.batch_size)
-        log_every = int(step_per_batch/200)
+        log_every = int(step_per_batch/10)
         check_dev_every = int(step_per_batch/5)
         g_step = 0
 
@@ -667,7 +1274,7 @@ class Manager:
                 g_step += 1
                 p, p_len, h, h_len, y = batch
                 run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-                _, acc, loss, summary = self.sess.run([self.train_op, self.acc, self.loss, self.merged], feed_dict={
+                _, acc, loss, l2_loss, summary = self.sess.run([self.train_op, self.acc, self.loss, self.l2_loss, self.merged], feed_dict={
                     self.input_p: p,
                     self.input_p_len: p_len,
                     self.input_h: h,
@@ -676,8 +1283,8 @@ class Manager:
                     self.dropout_keep_prob: 0.8,
                 }, run_metadata=self.run_metadata, options=run_options)
 
-                if g_step % log_every == 1 or g_step < 5:
-                    print("step{} : {} acc : {} ".format(g_step, loss, acc))
+                if g_step % log_every == 0 :
+                    print("step{} : Loss={} L2_loss={} acc : {} ".format(g_step, loss, l2_loss, acc))
                 if g_step % check_dev_every == 0 :
                     self.check_dev(dev_batches, g_step)
                 s_loss += loss
@@ -685,8 +1292,10 @@ class Manager:
                 self.train_writer.add_summary(summary, g_step)
                 self.train_writer.add_run_metadata(self.run_metadata, "meta_{}".format(g_step))
                 time_estimator.tick()
-
+                if math.isnan(loss):
+                    raise Exception("Nan loss reported")
             current_step = tf.train.global_step(self.sess, self.global_step)
             path = self.saver.save(self.sess, self.save_path(), global_step=current_step)
             print("Checkpoint saved at {}".format(path))
             print("Training Average loss : {} , acc : {}".format(s_loss, avg(l_acc)))
+        print("Best dev acc={}".format(self.best_acc))

@@ -5,8 +5,11 @@ pa = parser.add_argument
 pa("--datapath", type=str, default="data")
 pa("--batch_size", type=int, default="128")
 pa("--lstm_size", type=int, default="1024")
-pa("--max_sequence", type=int, default="400")
-pa("--frange", type=int, default="0")
+pa("--max_sequence", type=int, default="100")
+pa("--frange", type=int, default="50")
+pa("--corpus_name", type=str, default="multinli")
+pa("--learning_rate", type=float, default=3e-4)
+pa("--fm_latent", type=int, default="99")
 
 
 args = parser.parse_args()

@@ -75,6 +75,81 @@ class Analyzer():
                 E_list.append(raw_E)
         return E_list
 
+    def acc_per_common(self):
+        def eval(batch):
+            logit_out = self.manager.run_result(batch)
+            p, p_len, h, h_len, y = batch
+            pred_label = np.argmax(logit_out, axis=1)
+            return np.equal(y, pred_label)
+        idx2word = reverse_index(self.word2idx)
+        word_count = load_pickle("word_count")
+        sucs = 0
+        def rare_count(prem, hypo):
+            OOV = 0
+            PADDING = 1
+            prem_voca = set()
+            for i in range(len(prem)):
+                if prem[i] == PADDING:
+                    break
+                prem_voca.add(i)
+
+            def is_rare_word(token):
+                if token not in prem_voca:
+                    if token not in idx2word:
+                        return True
+                    if word_count[idx2word[token]] < 10:
+                        return True
+                return False
+            rare_words = 0
+            for i in range(len(hypo)):
+                if hypo[i] == PADDING:
+                    break
+                if is_rare_word(hypo[i]):
+                    rare_words += 1
+            return rare_words
+
+        suc_counter = Counter()
+        total_counter = Counter()
+        confusion_rare = Counter()
+        confusion_common = Counter()
+        for batch in self.dev_batches:
+            logit_out = self.manager.run_result(batch)
+            pred_label = np.argmax(logit_out, axis=1)
+            p, p_len, h, h_len, y = batch
+            corrects = np.equal(pred_label, y)
+            for i in range(len(y)):
+                item = rare_count(h[i],p[i])
+                total_counter[item] += 1
+                if corrects[i]:
+                    suc_counter[item] += 1
+                id = (pred_label[i], y[i])
+                if item > 0:
+                    confusion_rare[id] += 1
+                else:
+                    confusion_common[id] += 1
+
+            sucs += sum(corrects)
+
+        overall_acc = sucs / (len(self.dev_batches) * self.batch_size)
+        print("Overall : {} ".format(overall_acc))
+        for i in range(40):
+            if total_counter[i] > 0:
+                print("Rare#\t{0}\t{1:.2f}\t{2}\t{3}".format(i, suc_counter[i]/total_counter[i], suc_counter[i], total_counter[i]))
+
+        print("Confusion Common")
+        for i in range(3):
+            print("{}\t".format(i),end="")
+            for j in range(3):
+                print("{}\t".format(confusion_common[(i,j)]), end="")
+            print()
+
+        print("Confusion Rare")
+        for i in range(3):
+            print("{}\t".format(i),end="")
+            for j in range(3):
+                print("{}\t".format(confusion_rare[(i,j)]), end="")
+            print()
+
 
     def analyze_batch0(self, stop, target):
         PREMISE = 0
@@ -427,4 +502,4 @@ class Analyzer():
 
 if __name__ == "__main__":
     A = Analyzer()
-    A.view_pairs()
+    A.acc_per_common()

@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 from collections import Counter
 
@@ -51,6 +51,22 @@ def build_voca(path):
     return word2idx
 
 
+def voca_stat(path):
+    mnli_train = load_nli_data(path)
+    voca = Counter()
+    for datum in mnli_train:
+        s1_tokenize = tokenize(datum['sentence1_binary_parse'])
+        s2_tokenize = tokenize(datum['sentence2_binary_parse'])
+        for token in s1_tokenize + s2_tokenize:
+            voca[token] += 1
+    save_pickle("word_count", voca)
+    fout = open("word_count.txt", "w")
+    for word, count in voca.most_common():
+        fout.write("{}\t{}\n".format(word, count))
+    fout.close()
+
+
+
 def load_voca():
     if args.corpus_name == "multinli":
         return load_pickle("word2idx")
@@ -84,6 +100,25 @@ def transform_corpus(path, save_path, max_sequence = 400):
         s2, s2_len = convert(s2_tokenize)
         label = datum["label"]
         y = label
+        data.append({
+            'p': s1,
+            'p_len': s1_len,
+            'h': s2,
+            'h_len': s2_len,
+            'y': y})
+
+    for _ in range(10000):
+        idx1 = random.randint(0, len(mnli_train))
+        idx2 = random.randint(0, len(mnli_train))
+        datum1 = mnli_train[idx1]
+        datum2 = mnli_train[idx2]
+        s1_tokenize = tokenize(datum1['sentence1_binary_parse'])
+        s2_tokenize = tokenize(datum2['sentence2_binary_parse'])
+
+        s1, s1_len = convert(s1_tokenize)
+        s2, s2_len = convert(s2_tokenize)
+        y = 1
+
         data.append({
             'p': s1,
             'p_len': s1_len,
@@ -222,21 +257,56 @@ def eval_lrp():
     manager.load("hdrop/model-42952")
     manager.eval_lrp_feature(load_dev_data())
 
+def poly_analyze():
+    manager = init_manager()
+    manager.load("248/model-55224")
+    validate = load_dev_data()
+
+    manager.poly_weights(validate)
+
+
 def analyze():
     A =Analyzer()
     #A.multi_analysis()
     A.boy_girl()
 
+
+
+def interactive():
+    voca = load_voca()
+    manager = Manager(max_sequence=100, word_indice=voca, batch_size=args.batch_size,
+                      num_classes=3, vocab_size=1000,
+                      embedding_size=300, lstm_dim=1024)
+    # Dev acc=0.6576999819278717 loss=0.8433943867683411
+    #manager.load("hdrop2/model-41418")
+    manager.load("hdrop/model-42952")
+    manager.interactive(voca)
+
+def run_server():
+    voca = load_voca()
+    manager = Manager(max_sequence=100, word_indice=voca, batch_size=args.batch_size,
+                      num_classes=3, vocab_size=1000,
+                      embedding_size=300, lstm_dim=1024)
+    # Dev acc=0.6576999819278717 loss=0.8433943867683411
+    # manager.load("hdrop2/model-41418")
+    #manager.load("hdrop/model-42952")
+    manager.load("240/model-15735")
+    manager.run_server(voca)
+
+
 if __name__ == "__main__":
-    action = "lrp_run"
+    action = "interactive"
     if "build_voca" in action:
         word2idx = build_voca(path_dict["training_snli"])
         corpus_name = args.corpus_name
         save_pickle("word2idx_{}".format(corpus_name), word2idx)
 
+    if "voca_stat" in action:
+        voca_stat(path_dict["training_mnli"])
+
     # reformat corpus
     if "transform" in action:
-        transform_corpus(path_dict["dev_snli"], "dev_snli")
+        transform_corpus(path_dict["training_mnli"], "multinli_train_pp")
 
     if "train_fair" in action:
         train_fair()
@@ -247,8 +317,8 @@ if __name__ == "__main__":
     if "sa_run" in action:
         sa_run()
 
-    if "view_weights" in action:
-        view_weights()
+    if "poly_analyze" in action:
+        poly_analyze()
 
     if "lrp_run" in action:
         lrp_run()
@@ -264,3 +334,9 @@ if __name__ == "__main__":
 
     if "analyze" in action:
         analyze()
+
+    if "interactive" in action:
+        interactive()
+
+    if "run_server" in action:
+        run_server()

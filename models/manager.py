@@ -13,6 +13,7 @@ from random import shuffle
 from models.entangle import *
 import math
 from scipy.stats import chisquare
+import re
 
 def get_summary_path(name):
     i = 0
@@ -70,7 +71,7 @@ class Manager:
         config.gpu_options.allow_growth = True
         self.sess = tf.Session(config=config)
 
-        with tf.device('/cpu:0'):
+        with tf.device('/gpu:0'):
             tf.set_random_seed(2)
             self.network()
             self.global_step = tf.Variable(0, name='global_step', trainable=False)
@@ -355,6 +356,48 @@ class Manager:
                 print("{0:.1f} ".format(run_feature[i,dim*3+j]), end="")
             print()
 
+
+    def poly_weights(self, dev_data):
+        weight = tf.get_default_graph().get_tensor_by_name(name="predict/W:0")
+
+        def run_result(batch):
+            p, p_len, h, h_len, y = batch
+            return self.sess.run([self.logits, weight], feed_dict={
+                self.input_p: p,
+                self.input_p_len: p_len,
+                self.input_h: h,
+                self.input_h_len: h_len,
+                self.input_y: y,
+                self.dropout_keep_prob: 1.0,
+            })
+
+        batch_size = 30
+        dev_batches = get_batches(dev_data, batch_size, 100)
+        run_logits, run_weight = run_result(dev_batches[0])
+
+        dim_all, n_label = weight.get_shape().as_list()
+        print("Dimension : {}".format(dim_all))
+        dim = 100
+        D = {0: "E",
+             1: "N",
+             2: "C"}
+        p, p_len, h, h_len, y = dev_batches[0]
+        for i in range(batch_size):
+            print("-------")
+
+            for label in range(3):
+                print("Linear:", end="")
+                for j in range(dim):
+                    print("{0:.1f} ".format(run_weight[j, label]), end="")
+                print()
+                print("Square:", end="")
+                for j in range(dim):
+                    print("{0:.1f} ".format(run_weight[dim+j, label]), end="")
+                print()
+                print("XY:", end="")
+                for j in range(1000):
+                    print("{0:.1f} ".format(run_weight[dim*2+j, label]), end="")
+                print()
 
     def run_w_feature(self, batch):
         feature = tf.get_default_graph().get_tensor_by_name(name="feature:0")
@@ -983,6 +1026,194 @@ class Manager:
     def manaual_test(self, word2idx, idx2word):
         h1 = "It 's an interesting account of the violent history of modern Israel , and ends in the  Room where nine Jews were executed . "
 
+    def interactive(self, word2idx):
+        OOV = 0
+        PADDING = 1
+        max_sequence = 400
+
+        def tokenize(sentence):
+            def clean_str(string):
+                """
+                Tokenization/string cleaning for all datasets except for SST.
+                """
+                string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)
+                string = re.sub(r"\'s", " \'s", string)
+                string = re.sub(r"\'ve", " \'ve", string)
+                string = re.sub(r"n\'t", " n\'t", string)
+                string = re.sub(r"\'re", " \'re", string)
+                string = re.sub(r"\'d", " \'d", string)
+                string = re.sub(r"\'ll", " \'ll", string)
+                string = re.sub(r",", " , ", string)
+                string = re.sub(r"!", " ! ", string)
+                string = re.sub(r"\(", " \( ", string)
+                string = re.sub(r"\)", " \) ", string)
+                string = re.sub(r"\?", " \? ", string)
+                string = re.sub(r" \'(.*)\'([ \.])", r" \1\2", string)
+                string = re.sub(r"\s{2,}", " ", string)
+                return string.strip().lower()
+
+            tokens = clean_str(sentence).split(" ")
+            return tokens
+
+        def convert(tokens):
+            OOV = 0
+            l = []
+            for t in tokens:
+                if t in word2idx:
+                    l.append(word2idx[t])
+                else:
+                    l.append(OOV)
+                if len(l) == max_sequence:
+                    break
+            while len(l) < max_sequence:
+                l.append(1)
+            return np.array(l), len(tokens)
+
+
+        def predict(sents):
+            def transform(s):
+                return convert(tokenize(s))
+            data = []
+            for sent1, sent2 in sents:
+                p, p_len = transform(sent1)
+                h, h_len = transform(sent2)
+                data.append({
+                    'p': p,
+                    'p_len': p_len,
+                    'h': h,
+                    'h_len': h_len,
+                    'y': 0})
+
+            batches = get_batches(data, 100, 100)
+            p, p_len, h, h_len, y = batches[0]
+            logits, = self.sess.run([self.logits], feed_dict={
+                self.input_p: p,
+                self.input_p_len: p_len,
+                self.input_h: h,
+                self.input_h_len: h_len,
+                self.input_y: y,
+                self.dropout_keep_prob: 1.0,
+            })
+            return logits
+        terminate = False
+        sents = []
+        while not terminate:
+            msg = input("Enter:")
+            if msg == "!EOI":
+                r = predict([(sents[0], sents[1]), (sents[1], sents[0])])
+                print(r)
+                sents = []
+            elif msg == "!EXIT":
+                terminate = True
+            else:
+                sents.append(msg)
+
+    def run_server(self, word2idx):
+        OOV = 0
+        PADDING = 1
+        max_sequence = 400
+        from xmlrpc.server import SimpleXMLRPCServer
+        from xmlrpc.server import SimpleXMLRPCRequestHandler
+
+        def tokenize(sentence):
+            def clean_str(string):
+                """
+                Tokenization/string cleaning for all datasets except for SST.
+                """
+                string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)
+                string = re.sub(r"\'s", " \'s", string)
+                string = re.sub(r"\'ve", " \'ve", string)
+                string = re.sub(r"n\'t", " n\'t", string)
+                string = re.sub(r"\'re", " \'re", string)
+                string = re.sub(r"\'d", " \'d", string)
+                string = re.sub(r"\'ll", " \'ll", string)
+                string = re.sub(r",", " , ", string)
+                string = re.sub(r"!", " ! ", string)
+                string = re.sub(r"\?", " ? ", string)
+                string = re.sub(r" \'(.*)\'([ \.])", r" \1\2", string)
+                string = re.sub(r"\s{2,}", " ", string)
+                return string.strip().lower()
+
+            tokens = clean_str(sentence).split(" ")
+            return tokens
+
+        def convert(tokens):
+            OOV = 0
+            l = []
+            oov_cnt =0
+            for t in tokens:
+                if t in word2idx:
+                    l.append(word2idx[t])
+                else:
+                    l.append(OOV)
+                    oov_cnt += 1
+                if len(l) == max_sequence:
+                    break
+            if oov_cnt > len(l) * 0.3 :
+                print("WARNING : {} {}".format(oov_cnt, len(l)))
+                print(tokens)
+            while len(l) < max_sequence:
+                l.append(1)
+
+            return np.array(l), len(tokens)
+
+
+        def predict(sents):
+            def transform(s):
+                return convert(tokenize(s))
+            data = []
+            for sent1, sent2 in sents:
+                p, p_len = transform(sent1)
+                h, h_len = transform(sent2)
+
+                data.append({
+                    'p': p,
+                    'p_len': p_len,
+                    'h': h,
+                    'h_len': h_len,
+                    'y': 0})
+            batch_size = 100
+            ori_len = len(data)
+            if ori_len % batch_size:
+                for j in range(batch_size - ori_len % batch_size):
+                    data.append(data[-1])
+            batches = get_batches(data, batch_size, 100)
+            result = []
+            idx = 0
+            for batch in batches:
+                p, p_len, h, h_len, y = batch
+                if idx == 13:
+                    for j in range(100):
+                        loc = idx * 100 +j
+                        if loc >= len(sents):
+                            break
+
+                idx += 1
+                logits, = self.sess.run([self.logits], feed_dict={
+                    self.input_p: p,
+                    self.input_p_len: p_len,
+                    self.input_h: h,
+                    self.input_h_len: h_len,
+                    self.input_y: y,
+                    self.dropout_keep_prob: 1.0,
+                })
+                print("out")
+                result += logits.tolist()
+            print("return")
+            return result[:ori_len]
+
+        class RequestHandler(SimpleXMLRPCRequestHandler):
+            rpc_paths = ('/RPC2',)
+        print("Preparing server")
+        server = SimpleXMLRPCServer(("ingham.cs.umass.edu", 8125), requestHandler=RequestHandler)
+        server.register_introspection_functions()
+
+        server.register_function(predict, 'predict')
+        print("Waiting")
+        server.serve_forever()
+
+
+
     def run_adverserial(self, word2idx):
         test_cases, tag = adverserial.antonym()
         OOV = 0
@@ -1256,6 +1487,7 @@ class Manager:
         self.best_acc = 0
         if not rerun:
             self.sess.run(tf.global_variables_initializer())
+        shuffle(data)
         batches = get_batches(data, self.batch_size, self.sent_crop_len)
         dev_batch_size = 200
         dev_batches = get_batches(valid_data, dev_batch_size, self.sent_crop_len)

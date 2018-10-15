@@ -41,11 +41,11 @@ def cafe_network(input_p, input_h, input_p_len, input_h_len, batch_size, num_cla
         v_3 = batch_FM(f_odot, s_len, highway_size, "{}/odot".format(name))
         return tf.stack([v_1, v_2, v_3], axis=2)
 
-    with tf.device('/cpu:0'):
+    with tf.device('/gpu:0'):
         p_enc1, p_intra_att = encode(input_p[:, :p_len], p_len, "premise")  # [batch, s_len, dim*2]
         p_intra = align_fm(p_enc1, p_intra_att, input_p_len, "premise_intra") # [batch, s_len, 3]
 
-    with tf.device('/cpu:0'):
+    with tf.device('/gpu:0'):
         h_enc1, h_intra_att = encode(input_h[:, :h_len], h_len, "hypothesis")
         h_intra = align_fm(h_enc1, h_intra_att, input_h_len, "hypothesis_intra")
 
@@ -68,7 +68,6 @@ def cafe_network(input_p, input_h, input_p_len, input_h_len, batch_size, num_cla
         h_width = 4*(encode_width*2)
         h = highway_layer(feature, h_width, tf.nn.relu, "pred/high1")
         h2 = highway_layer(h, h_width, tf.nn.relu, "pred/high2")
-
         h2_drop = tf.nn.dropout(h2, dropout_keep_prob)
         y_pred = dense(h2_drop, h_width, num_classes, "pred/dense")
     return y_pred
@@ -132,11 +131,14 @@ def cafe_direct_emb(p_emb, h_emb, input_p_len, input_h_len, num_classes, embeddi
 
         feature = tf.concat([f_concat, f_sub, f_odot], axis=1, name="feature")
         h_width = 4*(encode_width*2)
-        h = highway_layer(feature, h_width, tf.nn.relu, "pred/high1")
-        h2 = highway_layer(h, h_width, tf.nn.relu, "pred/high2")
 
-        h2_drop = tf.nn.dropout(h2, dropout_keep_prob)
-        y_pred = dense(h2_drop, h_width, num_classes, "pred/dense")
+        if False:
+            y_pred = polynom_layer(feature, h_width)
+        else:
+            h = highway_layer(feature, h_width, tf.nn.relu, "pred/high1")
+            h2 = highway_layer(h, h_width, tf.nn.relu, "pred/high2")
+            h2_drop = tf.nn.dropout(h2, dropout_keep_prob)
+            y_pred = dense(h2_drop, h_width, num_classes, "pred/dense")
     return y_pred
 
 

@@ -3,28 +3,6 @@ import pickle
 import numpy as np
 import tensorflow as tf
 
-from parameter import *
-
-
-def avg(l):
-    return sum(l)/len(l)
-
-
-def load_pickle(name):
-    path = os.path.join("pickle", name)
-    return pickle.load(open(path,"rb"))
-
-
-def save_pickle(name, obj):
-    path = os.path.join("pickle", name)
-    return pickle.dump(obj, open(path,"wb"))
-
-def reverse_index(word2idx):
-    idx2word = dict()
-    for word, idx in word2idx.items():
-        idx2word[idx] = word
-    return idx2word
-
 def print_shape(name, tensor):
     print("{} : {}".format(name, tensor.shape))
 
@@ -44,76 +22,6 @@ def length(sequence):
     return length, mask
 
 
-def glove_voca():
-    path = path_dict["embedding_data_path"]
-    voca = set()
-    with open(path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            s = line.split()
-            voca.add(s[0])
-    return voca
-
-
-def get_batches(data, batch_size, crop_max = 100):
-    # data is fully numpy array here
-    step_size = int((len(data) + batch_size - 1) / batch_size)
-    new_data = []
-    for step in range(step_size):
-        p = []
-        p_len_list = []
-        h = []
-        h_len_list = []
-        y = []
-        for i in range(batch_size):
-            idx = step * batch_size + i
-            if idx >= len(data):
-                break
-            p_len = min(data[idx]['p_len'], crop_max)
-            p.append(data[idx]['p'][:crop_max])
-            p_len_list.append(p_len)
-
-            h_len = min(data[idx]['h_len'], crop_max)
-            h.append(data[idx]['h'][:crop_max])
-            h_len_list.append(h_len)
-
-            y.append(data[idx]['y'])
-        if len(p) > 0:
-            new_data.append((np.stack(p), np.stack(p_len_list), np.stack(h), np.stack(h_len_list), np.stack(y)))
-    return new_data
-
-
-def load_embedding(word_indices, word_embedding_dimension, divident=1.0):
-    print("loading embedding")
-    path = path_dict["embedding_data_path"]
-    """
-    Load GloVe embeddings. Doing a random normal initialization for OOV words.
-    """
-    j = 0
-    n = len(word_indices)
-    m = word_embedding_dimension
-    emb = np.empty((n, m), dtype=np.float32)
-
-    emb[:, :] = np.random.normal(size=(n, m)) / divident
-
-    # Explicitly assign embedding of <PAD> to be zeros.
-    emb[0, :] = np.zeros((1, m), dtype="float32")
-    emb[1, :] = np.zeros((1, m), dtype="float32")
-    count=0
-    with open(path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-
-            s = line.split()
-            if s[0] in word_indices:
-                try:
-                    emb[word_indices[s[0]], :] = np.asarray(s[1:])
-                    count += 1
-                except ValueError:
-                    print(s[0])
-                    continue
-
-    print("{} of {} initialized".format(count, len(word_indices)))
-    save_pickle("wemb", emb)
-    return emb
 
 
 def biLSTM(inputs, dim, name):
@@ -213,6 +121,22 @@ def inter_attention(p, h, name):
 
         return alpha, beta
 
+# add s2 's information to s1
+def attention(s1, s2, dim1, dim2, dim_inter, name):
+    _, max_seq1, _ = s1.get_shape().as_list()
+    _, max_seq2, _ = s2.get_shape().as_list()
+    with tf.variable_scope(name):
+        W1, b1 = weight_bias([dim1, dim_inter], [dim_inter])
+        W2, b2 = weight_bias([dim2, dim_inter], [dim_inter])
+        F_1 = tf.nn.relu(seq_xw_plus_b(s1, W1, b1))  # [batch, seq_1, dim_inter]
+        F_2 = tf.nn.relu(seq_xw_plus_b(s2, W2, b2))  # [batch, seq_2, dim_inter]
+        E = tf.matmul(F_1, F_2, transpose_b=True) # [batch, seq_1, seq_2]
+
+        E_soft = tf.nn.softmax(E, dim=2)
+        alpha= tf.transpose(tf.matmul(s2, E_soft, transpose_a=True), [0,2,1] ) # [batch, seq_1, dim_2 ]
+        return alpha
+
+
 def interaction_feature(a,b, axis):
     f_concat = tf.concat([a, b], axis=axis)
     f_sub = a - b
@@ -306,29 +230,3 @@ def LSTM_pool(input, max_seq, input_len, dim, dropout_keep_prob, name):
 
     return tf.reshape(tf.concat([max_pooled, avg_pooled], axis=2),[-1, dim*2], name="encode_{}".format(name))
 
-
-def multiply_layer(h, in_dim, out_dim, multi_dim, l2_loss):
-    with tf.variable_scope("multiply_layer"):
-        multi_factor = dense(h, in_dim, multi_dim, l2_loss, "multiply_factor") # [batch, multi_dim]
-
-        multi_tile = tf.transpose(tf.reshape(tf.tile(multi_factor, [1,in_dim]), [-1, multi_dim, in_dim]), [0,2,1])
-        print_shape("multi_tile", multi_tile)
-        h_tile = tf.reshape(tf.tile(h, [1, multi_dim]), [-1, in_dim, multi_dim])
-
-        prod = tf.reshape(tf.multiply(h_tile, multi_tile), [-1, in_dim* multi_dim])
-        out = dense(prod, in_dim*multi_dim, out_dim, l2_loss, "multi_dense")
-        print_shape("multiply_layer out ", out)
-        return out
-
-def polynom_layer(x_in, in_dim):
-    print("Using polynom_layer")
-    dim = 100
-    #x = dense(x_in, in_dim, dim, "dimension_reducer")  # [batch, dim]
-
-    #x2 = tf.multiply(x, x)
-    #xy = cartesian(x, x) # [batch, dim, dim]
-    #xy = tf.reshape(xy, [-1, dim*dim])
-
-    #x_all = tf.concat([x,x2,xy], axis=1) # [batch, 2*dim + dim*dim]
-    #return dense(x_all, 2*dim+dim*dim, 3, "predict")
-    return dense(x_in, in_dim, 3, "predict")

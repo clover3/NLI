@@ -67,13 +67,14 @@ class Manager:
 
         self.train_op = None
         config = tf.ConfigProto(allow_soft_placement=True,
-                                  log_device_placement=False )
+                                  log_device_placement=False)
         config.gpu_options.allow_growth = True
         self.sess = tf.Session(config=config)
 
         with tf.device('/gpu:0'):
             tf.set_random_seed(2)
             self.network()
+
             self.global_step = tf.Variable(0, name='global_step', trainable=False)
             self.train_op = self.get_train_op()
         self.merged = tf.summary.merge_all()
@@ -104,9 +105,15 @@ class Manager:
                     wemb =load_pickle("wemb")
 
                 self.embedding = tf.Variable(wemb, trainable=False)
+            p_emb_raw = tf.nn.embedding_lookup(self.embedding, self.input_p, name="premise")  # [batch, max_seq, dim]
+            self.input_p_emb = tf.placeholder_with_default(p_emb_raw, name="emb_premise",
+                                                           shape=[None, self.max_seq, self.embedding_size ])
+            h_emb_raw = tf.nn.embedding_lookup(self.embedding, self.input_h, name="hypothesis")  # [batch, max_seq, dim]
+            self.input_h_emb = tf.placeholder_with_default(h_emb_raw, name="emb_hypothesis",
+                                                           shape=[None, self.max_seq, self.embedding_size])
 
-            logits = cafe_network (self.input_p,
-                                   self.input_h,
+            logits = cafe_network (self.input_p_emb,
+                                   self.input_h_emb,
                                    self.input_p_len,
                                    self.input_h_len,
                                    self.batch_size,
@@ -627,8 +634,541 @@ class Manager:
             return logit
 
 
+    def GI_feature_layer(self, dev_data, idx2word):
+        NotImplementedError
 
 
+    def explain_eval(self, data, idx2word):
+        crop_max = 100
+        batch_size = 100
+        PAD = 1
+
+        def explain_by_gradient(data, method_name, de, label_type):
+            soft_out = tf.nn.softmax(self.logits)
+            p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
+            h_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="hypothesis:0")
+            stop = [p_emb_tensor, h_emb_tensor]
+            x_input = [self.input_p, self.input_p_len, self.input_h, self.input_h_len, self.dropout_keep_prob]
+            x_input = [self.input_p_emb, self.input_p_len, self.input_h_emb, self.input_h_len, self.dropout_keep_prob]
+            PREMISE = 0
+            HYPOTHESIS = 1
+            stop = [self.input_p_emb, self.input_h_emb]
+
+            def fetch_salience(batch):
+                p, p_len, h, h_len, y = batch
+                xi = [p, p_len, h, h_len, 1.0]
+                p2logit = []
+                h2logit = []
+                stop_val = self.sess.run(stop, feed_dict={
+                    self.input_p: p,
+                    self.input_p_len: p_len,
+                    self.input_h: h,
+                    self.input_h_len: h_len,
+                    self.input_y: y,
+                    self.dropout_keep_prob: 1.0,
+                })
+                p_emb, h_emb = stop_val
+                xi = [p_emb, p_len, h_emb, h_len, 1.0]
+
+                for i in range(3):
+                    fl = de.explain(method_name, soft_out[:,i], stop, x_input, xi, stop_val)
+                    # len(fl) == 2   # [PREMISE, HYPOTHESIS]
+                    # fl[PREMISE] has shape [-1, max_seq, emb_dim]
+                    p2logit.append(fl[PREMISE])
+                    h2logit.append(fl[HYPOTHESIS])
+                return np.stack(p2logit, axis=1), np.stack(h2logit, axis=1)
+
+            batches = get_batches(data, batch_size, crop_max)
+
+            p2logit_list, h2logit_list = zip(*list([fetch_salience(b) for b in batches]))
+            # list [ x.shape = [-1, 3, max_seq, emb_dim] ]
+
+            p2logit = np.concatenate(p2logit_list, axis=0)
+            h2logit = np.concatenate(h2logit_list, axis=0)
+
+
+            assert len(p2logit.shape) == 4
+            assert p2logit.shape[0] == len(data)
+            p_ce = p2logit[:,2] - p2logit[:,0]
+            h_ce = h2logit[:,2] - h2logit[:,0]
+
+            p_ec_n = p2logit[:,2] + p2logit[:,0] - p2logit[:,1]
+            h_ec_n = h2logit[:, 2] + h2logit[:, 0] - h2logit[:, 1]
+
+            if label_type == "conflict":
+                p_attrib = p_ce
+                h_attrib = h_ce
+            elif label_type == 'match':
+                p_attrib = p_ec_n
+                h_attrib = h_ec_n
+            else:
+                raise NotImplementedError
+
+            num_case = len(data)
+            explains = []
+            for i in range(num_case):
+                e_from_p = []
+                e_from_h = []
+                for idx_p in range(data[i]['p_len']):
+                    salience = p_attrib[i,idx_p]
+                    score = np.sum(salience)
+                    e_from_p.append((score, idx_p))
+
+                for idx_h in range(data[i]['h_len']):
+                    salience = h_attrib[i,idx_h]
+                    score = np.sum(salience)
+                    e_from_h.append((score, idx_h))
+                e_from_p.sort(key=lambda x: x[0], reverse=True)
+                e_from_h.sort(key=lambda x: x[0], reverse=True)
+
+                explains.append((e_from_p, e_from_h))
+            return explains
+
+        def explain_by_deletion(data, target_label):
+            inputs = []
+            inputs_info = []
+            base_indice = []
+            for entry in data:
+                base_case = entry
+                base_case_idx = len(inputs_info)
+                base_indice.append(base_case_idx)
+                inputs.append(base_case)
+                info = {
+                    'base_case_idx': base_case_idx,
+                    'type': 'base_run',
+                }
+                inputs_info.append(info)
+
+                for p_idx in range(base_case['p_len']):
+                    assert base_case['p'].shape == (400,)
+                    head = base_case['p'][:p_idx]
+                    tail = base_case['p'][p_idx+1:]
+                    p = np.concatenate([head,tail])
+                    new_case = {
+                        'p' : p,
+                        'p_len': base_case['p_len'] - 1,
+                        'h': base_case['h'],
+                        'h_len': base_case['h_len'],
+                        'y': base_case['y'],
+                    }
+                    info = {
+                        'base_case_idx': base_case_idx,
+                        'type' : 'p_mod',
+                        'mod_idx': p_idx
+                    }
+                    inputs.append(new_case)
+                    inputs_info.append(info)
+
+                for h_idx in range(base_case['h_len']):
+                    head = base_case['h'][:h_idx]
+                    tail = base_case['h'][h_idx+1:]
+                    h = np.concatenate([head,tail])
+                    new_case = {
+                        'p' : base_case['p'],
+                        'p_len': base_case['p_len'],
+                        'h': h,
+                        'h_len': base_case['h_len'] - 1,
+                        'y': base_case['y'],
+                    }
+                    info = {
+                        'base_case_idx': base_case_idx,
+                        'type' : 'h_mod',
+                        'mod_idx': h_idx
+                    }
+                    inputs.append(new_case)
+                    inputs_info.append(info)
+
+            batches = get_batches(inputs, batch_size, crop_max)
+            print("Running {} batches".format(len(batches)))
+
+            def get_probs(batch):
+                logits = self.run_result(batch)
+
+                def softmax(w, t=1.0):
+                    e = np.exp(w / t)
+                    dist = e / np.sum(e)
+                    return dist
+                return softmax(logits)
+
+            logits_list = np.concatenate(list([get_probs(batch) for batch in batches]), axis=0)
+            if target_label == 'conflict':
+                logit_attrib_list = logits_list[:,2] - logits_list[:,0]
+            elif target_label == 'match':
+                logit_attrib_list = logits_list[:, 2] + logits_list[:, 0] - logits_list[:, 1]
+
+            assert len(logits_list) == len(inputs)
+
+
+            explains = []
+            for case_idx in base_indice:
+                base_ce = logit_attrib_list[case_idx]
+                idx = case_idx + 1
+                e_from_p = []
+                e_from_h = []
+                while idx < len(inputs_info) and inputs_info[idx]['base_case_idx'] == case_idx:
+                    after_ce= logit_attrib_list[idx]
+                    diff_ce = base_ce - after_ce
+                    score = diff_ce
+                    if inputs_info[idx]['type'] == 'p_mod':
+                        p_idx = inputs_info[idx]['mod_idx']
+                        e_from_p.append((score, p_idx))
+                    if inputs_info[idx]['type'] == 'h_mod':
+                        h_idx = inputs_info[idx]['mod_idx']
+                        e_from_h.append((score, h_idx))
+                    idx += 1
+
+                e_from_p.sort(key=lambda x: x[0], reverse=True)
+                e_from_h.sort(key=lambda x: x[0], reverse=True)
+
+                explains.append((e_from_p, e_from_h))
+            return explains
+
+        methods = ["saliency","grad*input", "intgrad", "elrp", "deeplift", "occlusion"]
+        methods = ["saliency","grad*input", "intgrad", "elrp", "deeplift", ]
+        #methods = ["saliency",]
+
+        explains_gi = dict()
+        clock_time = dict()
+        with DeepExplain(session=self.sess) as de:
+            for method in methods:
+                begin = time.time()
+                explains_gi[method] = explain_by_gradient(data, method, de, 'match')
+                clock_time[method] = time.time() - begin
+
+        begin = time.time()
+        explains_gi["deletion"] = explain_by_deletion(data, 'match')
+        clock_time["deletion"] = time.time() - begin
+
+        # P@1
+        def get_explain(entry):
+            return entry['p_explain'], entry['h_explain']
+
+        golds = list([get_explain(e) for e in data])
+
+        def p_at_k_list(explains, golds, k):
+            def p_at_k(rank_list, gold_set, k):
+                tp = 0
+                for score, e in rank_list[:k]:
+                    if e in gold_set:
+                        tp += 1
+                return tp / k
+
+            score_list_h = []
+            score_list_p = []
+            for pred, gold in zip(explains, golds):
+                pred_p, pred_h = pred
+                gold_p, gold_h = gold
+                if gold_p :
+                    s1 = p_at_k(pred_p, gold_p, k)
+                    score_list_p.append(s1)
+                if gold_h:
+                    s2 = p_at_k(pred_h, gold_h, k)
+                    score_list_h.append(s2)
+            return avg(score_list_p + score_list_h)
+
+        def MAP(explains, golds):
+            def AP(pred, gold):
+                n_pred_pos = 0
+                tp = 0
+                sum = 0
+                for score, e in pred:
+                    n_pred_pos += 1
+                    if e in gold:
+                        tp += 1
+                        sum += (tp / n_pred_pos)
+                return sum / len(gold)
+
+            score_list_h = []
+            score_list_p = []
+            for pred, gold in zip(explains, golds):
+                pred_p, pred_h = pred
+                gold_p, gold_h = gold
+                if gold_p :
+                    s1 = AP(pred_p, gold_p)
+                    score_list_p.append(s1)
+                if gold_h:
+                    s2 = AP(pred_h, gold_h)
+                    score_list_h.append(s2)
+            return avg(score_list_p + score_list_h)
+
+        def textrize(sequence):
+            for s in sequence:
+                if s == 1:
+                    break
+                if s not in idx2word:
+                    yield "OOV"
+                else:
+                    yield idx2word[s]
+
+        def show_errors(data, explains, golds):
+            for i in range(30):
+                pred = explains[i]
+                gold = golds[i]
+                pred_p, pred_h = pred
+                gold_p, gold_h = gold
+
+                prem = list(textrize(data[i]['p']))
+                hypo = list(textrize(data[i]['h']))
+                print("Prem:" + " ".join(prem))
+                print("Hypo:" + " ".join(hypo))
+
+                gold_p_text = " ".join([prem[j] for j in gold_p[:10]])
+                gold_h_text = " ".join([hypo[j] for j in gold_h[:10]])
+
+                print("Prem Gold: " + gold_p_text)
+                for score, idx in pred_p:
+                    print("{}\t{}".format(prem[idx], score))
+                print("Hypo Gold: " + gold_h_text)
+                for score, idx in pred_h:
+                    print("{}\t{}".format(hypo[idx], score))
+
+        def store_analysis(data, explains, name):
+            result = []
+            for i in range(50):
+                pred = explains[i]
+                gold = golds[i]
+                pred_p, pred_h = pred
+                gold_p, gold_h = gold
+
+                prem = list(textrize(data[i]['p']))
+                hypo = list(textrize(data[i]['h']))
+                gold_p_text = " ".join([prem[j] for j in gold_p[:10]])
+                gold_h_text = " ".join([hypo[j] for j in gold_h[:10]])
+
+                entry = pred_p, pred_h, prem, hypo
+                result.append(entry)
+            save_pickle("conflict_"+ name, result)
+
+
+        best_map = -1
+        best_method = ""
+        for method in methods + ["deletion"]:
+            print(method)
+            print("Clock Time : {}".format(clock_time[method]))
+            map_val = MAP(explains_gi[method], golds)
+            if map_val > best_map:
+                best_map = map_val
+                best_method = method
+            print("MAP : {}".format(map_val))
+            print("P@1 : {}".format(p_at_k_list(explains_gi[method], golds, 1)))
+            print("P@3 : {}".format(p_at_k_list(explains_gi[method], golds, 3)))
+            print("P@5 : {}".format(p_at_k_list(explains_gi[method], golds, 5)))
+
+        print("Best Method : " + best_method)
+        for method in methods:
+            store_analysis(data, explains_gi[method], "analysis_match_{}".format(method))
+        #show_errors(data, explains_gi[best_method], golds)
+
+
+    def GI_input_layer(self, dev_data, idx2word):
+        r = [2, 1, 0.5, 0.2, 0.1, 0.05]
+        emb_range = r + [0] +[-item for item in r]
+        emb_range = [0,0]
+        print(emb_range)
+        batch_size = 100
+        max_seq = 100
+        def word(index):
+            if index in idx2word:
+                if idx2word[index] == "<PADDING>":
+                    return "PADDING"
+                else:
+                    return idx2word[index]
+            else:
+                return "OOV"
+
+        dev_batches = get_batches(dev_data, batch_size, max_seq)
+        emb_size = 300
+        input_size = emb_size * 20
+        p, p_len, h, h_len, y = dev_batches[0]
+        p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
+        h_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="hypothesis:0")
+        p_emb, h_emb = self.sess.run([p_emb_tensor, h_emb_tensor], feed_dict={
+            self.input_p: p,
+            self.input_p_len: p_len,
+            self.input_h: h,
+            self.input_h_len: h_len,
+            self.input_y: y,
+            self.dropout_keep_prob: 1.0,
+        })
+
+        def fetch_grad(p_emb, h_emb):
+            g = [tf.gradients(self.logits[:,i], h_emb_tensor)[0] for i in range(3)]
+            g_out = self.sess.run(g, feed_dict={
+                self.input_p_emb: p_emb,
+                self.input_p_len: p_len,
+                self.input_h_emb: h_emb,
+                self.input_h_len: h_len,
+                self.dropout_keep_prob: 1.0,
+            })
+            return g_out[2] - g_out[0]
+
+        def fetch_logit(p_emb, h_emb):
+            logits, = self.sess.run([self.logits], feed_dict={
+                self.input_p_emb: p_emb,
+                self.input_p_len: p_len,
+                self.input_h_emb: h_emb,
+                self.input_h_len: h_len,
+                self.dropout_keep_prob: 1.0,
+            })
+            return logits
+
+        def fetch_ce(p_emb, h_emb):
+            l = fetch_logit(p_emb, h_emb)
+            return l[:,2] - l[:,0]
+
+
+        def diff_sum(grad1, grad2):
+            # [batch_size, sequence, embedding]
+            gdiff = grad2 - grad1
+            return np.sum(np.sum(gdiff, axis=2), axis=1)
+
+
+        f = open("deletion.html", "w")
+        f.write("<html>")
+        def print_color_html(word, r):
+            bg_color =  "ff" + ("%02x" % r) + ("%02x" % r)
+
+            html = "<td bgcolor=\"#{}\">&nbsp;{}&nbsp;</td>".format(bg_color, word)
+            #html = "<span style=\"color:#{}; background-color:#{}\">{}</span>&nbsp;\n".format(text_color, bg_color, word)
+            return html
+
+        for target_idx in range(11,15):
+            for i in range(batch_size):
+                p_emb[i] = p_emb[target_idx]
+                h_emb[i] = h_emb[target_idx]
+
+            base_gradient = fetch_grad(p_emb, h_emb)
+            base_logits = fetch_logit(p_emb, h_emb)
+            base_ce = base_logits[:,2] - base_logits[:,0]
+
+            # For hypothesis
+            h_emb_alt = np.copy(h_emb)
+            batch_h = []
+            batch_info = []
+            for token_i in range(20):
+                h_emb_alt = np.copy(h_emb[target_idx])
+                h_emb_alt[token_i:-1] = h_emb[target_idx, token_i+1:]
+                batch_h.append(h_emb_alt)
+                batch_info.append((token_i))
+
+            scores = Counter()
+            diff_logit_max = Counter()
+
+            n_step = int((len(batch_h)-1)/batch_size) + 1
+            ticker = TimeEstimator(n_step)
+            for i in range(n_step):
+                st = i * batch_size
+                ed = (i+1) * batch_size
+                ticker.tick()
+                h_emb_alt = np.stack(batch_h[st:ed], axis=0)
+                item_len = len(batch_h[st:ed])
+
+                input_gradient = fetch_grad(p_emb[:item_len], h_emb_alt)
+                score = diff_sum(base_gradient[:item_len], input_gradient)
+                logits = fetch_logit(p_emb[:item_len], h_emb_alt)
+                alt_ce = logits[:,2] - logits[:,0]
+                diff_logit = np.abs(alt_ce - base_ce[:item_len])
+                print(diff_logit)
+                for j in range(item_len):
+                    deleted_index = batch_info[st+j]
+                    print("Deleted :{}".format(word(h[target_idx, deleted_index])))
+                    print("Logits {} -> {}".format(base_logits[j], logits[j]))
+                    if scores[batch_info[st+j]] < score[j]:
+                        scores[batch_info[st + j]] = score[j]
+                    if diff_logit_max[batch_info[st+j]] < diff_logit[j]:
+                        diff_logit_max[batch_info[st + j]] = diff_logit[j]
+            GI_score = np.zeros([max_seq])
+            diff_score_h = np.zeros([max_seq])
+            for token_i in diff_logit_max.keys():
+                print(token_i)
+                GI_score[token_i] = scores[token_i]
+                diff_score_h[token_i] = diff_logit_max[token_i]
+
+            # For premise
+
+            p_emb_alt = np.copy(p_emb)
+            batch_h = []
+            batch_info = []
+            for token_i in range(20):
+                p_emb_alt = np.copy(p_emb[target_idx])
+                p_emb_alt[token_i:-1] = p_emb[target_idx, token_i+1:]
+                batch_h.append(p_emb_alt)
+                batch_info.append((token_i))
+
+            diff_logit_max_p = Counter()
+
+            print("Testing Premise")
+            n_step = int(1+ (len(batch_h)-1) / batch_size)
+            ticker = TimeEstimator(n_step)
+            for i in range(n_step):
+                st = i * batch_size
+                ed = (i + 1) * batch_size
+                ticker.tick()
+                p_emb_alt = np.stack(batch_h[st:ed], axis=0)
+                item_len = len(batch_h[st:ed])
+                logits = fetch_logit(p_emb_alt, h_emb[:item_len])
+                alt_ce = logits[:,2] - logits[:,0]
+                diff_logit = np.abs(alt_ce - base_ce[:item_len])
+                for j in range(item_len):
+                    deleted_index = batch_info[st+j]
+                    print("Deleted :{}".format(word(p[target_idx, deleted_index])))
+                    print("Logits {} -> {}".format(base_logits[j], logits[j]))
+                    if diff_logit_max_p[batch_info[st + j]] < diff_logit[j]:
+                        diff_logit_max_p[batch_info[st + j]] = diff_logit[j]
+
+            diff_score_p = np.zeros([max_seq])
+            for token_i in diff_logit_max_p.keys():
+                diff_score_p[token_i] = diff_logit_max_p[token_i]
+
+            save_pickle("gi_scores", scores)
+
+
+            f.write("<tr>")
+            f.write("<td><b>Premise<b></td>\n")
+            f.write("<table style=\"border:1px solid\">")
+            def max_n(np_ar):
+                cap = np.max(np_ar)
+                if cap == 0 :
+                    cap = 1
+                return cap
+
+            cap = max_n(diff_score_p)
+            for i_h in range(20):
+                raw_word = word(p[target_idx,i_h])
+                if raw_word == "PADDING":
+                    break
+                print("{0}({1:.2f}) ".format(word(p[target_idx,i_h]), diff_score_p[i_h] / cap), end="")
+                r = 255 - int(diff_score_p[i_h] / cap * 255)
+                f.write(print_color_html(word(p[target_idx,i_h]), r))
+            f.write("</tr>")
+
+            print()
+            f.write("</tr></table>")
+
+            cap = max_n(GI_score)
+            for i_h in range(20):
+                print("{0}({1:.2f}) ".format(word(h[target_idx,i_h]), GI_score[i_h] / cap), end="")
+
+            print()
+
+            f.write("<td><b>Hypothesis<b></td>\n")
+            f.write("<table style=\"border:1px solid\">")
+            cap = max_n(diff_score_h)
+            print("Delete score : ", end="")
+            for i_h in range(20):
+                raw_word = word(h[target_idx,i_h])
+                if raw_word == "PADDING":
+                    break
+                print("{0}({1:.2f}) ".format(word(h[target_idx,i_h]), diff_score_h[i_h] / cap), end="")
+                r = 255 - int(diff_score_h[i_h] / cap * 255)
+                f.write(print_color_html(word(h[target_idx,i_h]), r))
+            f.write("</tr>")
+
+            print()
+            f.write("</tr></table>")
+            f.write("</div><hr>")
+
+        f.write("</html>")
 
     def eval_lrp_feature(self, dev_data):
 
@@ -746,10 +1286,12 @@ class Manager:
                 return result
 
             soft_out = tf.nn.softmax(self.logits)
-            feature_e = de.explain('grad*input', soft_out[:,0], [feature], x_input, xi)
-            feature_c = de.explain('grad*input', soft_out[:,2], [feature], x_input, xi)
+            feature2logit = []
+            for i in range(3):
+                fl = de.explain('grad*input', soft_out[:,i], [feature], x_input, xi)
+                feature2logit.append(fl[0])
 
-            feature_ce = feature_e[0] - feature_c[0]
+            feature_ce = feature2logit[2] - feature2logit[0]
             save_pickle("feature_ce", feature_ce)
 
             #E_list = load_E_particle()
@@ -759,20 +1301,14 @@ class Manager:
             f_end = 612*3
             print("E[0][0].shape: {}".format(E_list[0][PREMISE].shape))
 
-            def softmax(w, t=1.0):
-                e = np.exp(w / t)
-                dist = e / np.sum(e)
-                return dist
-
 
             def print_table(f, entangle, p_len, h_len, p, h, summary):
                 if summary is not None:
                     h_summary, p_summary = summary
                 cap = np.max(entangle)
                 def gen_color(v):
-
                     b = int(255- v/cap * 255)
-                    b = max(255-v*100,0)
+                    #b = int(max(255-v*100,0))
                     return ("%02x" % b) + ("%02x" % b) + "ff"
 
                 def ce_color(v):
@@ -839,18 +1375,25 @@ class Manager:
                         for f in range(f_size):
                             r_i_sum[s][i] += abs(E_list[f][s][b,i])
 
+                print(list(feature2logit[pred[b]][b,:]))
                 for f in range(f_begin, f_end):
                     p_r = E_list[f][PREMISE]
                     h_r = E_list[f][HYPOTHESIS]
                     p_r_sum = np.sum(p_r, axis=1)
-                    r_f = feature_c[0][b, f] - feature_e[0][b, f]
+                    #r_f = feature_c[0][b, f] - feature_e[0][b, f]
+
                     #factor = math.exp(r_f)
                     f_i_p = feature_out[b, f-612*2]
                     f_i_h = feature_out[b, f-612]
                     if f_i_p == 0.0 and f_i_h == 0.0:
                         factor = 0
                     else:
-                        factor = math.exp(-(abs(0.1 * (f_i_h-f_i_p)/(abs(f_i_h)+abs(f_i_p)))))
+                        #factor = math.exp(-(abs(0.1 * (f_i_h-f_i_p)/(abs(f_i_h)+abs(f_i_p)))))
+                        factor = abs(feature2logit[pred[b]][b,f])
+                        if factor > 0.001:
+                            factor = 1
+                        else:
+                            factor = 0
 
                     for i_p in range(p_len[b]):
                         for i_h in range(h_len[b]):
@@ -1127,7 +1670,7 @@ class Manager:
                 string = re.sub(r"\'re", " \'re", string)
                 string = re.sub(r"\'d", " \'d", string)
                 string = re.sub(r"\'ll", " \'ll", string)
-                string = re.sub(r",", " , ", string)
+                string = re.sub(r",", " -, ", string)
                 string = re.sub(r"!", " ! ", string)
                 string = re.sub(r"\?", " ? ", string)
                 string = re.sub(r" \'(.*)\'([ \.])", r" \1\2", string)
@@ -1332,22 +1875,14 @@ class Manager:
         p_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="premise:0")
         h_emb_tensor = tf.get_default_graph().get_tensor_by_name(name="hypothesis:0")
 
-        def print_color_html(word, r0, r1, r2, r_max, r_min):
-            def normalize(val):
-                v = (val - r_min) / (r_max - r_min) * 255
-                assert( v < 256 and v >= 0 )
-                return v
-            normal_val = [normalize(r) for r in [r0, r1, r2]]
-            bg_color = "".join(["%02x" % v for v in normal_val])
-            if sum(normal_val) > 256 * 3 * 0.7:
-                text_color = "000000" # black
-            else:
-                text_color = "ffffff" # white
-            html = "<span style=\"color:#{}; background-color:#{}\">{}</span>&nbsp;\n".format(text_color, bg_color, word)
+        def print_color_html(word, r):
+            bg_color =  "ff" + ("%02x" % r) + ("%02x" % r)
+
+            html = "<td bgcolor=\"#{}\">&nbsp;{}&nbsp;</td>".format(bg_color, word)
+            #html = "<span style=\"color:#{}; background-color:#{}\">{}</span>&nbsp;\n".format(text_color, bg_color, word)
             return html
 
         with DeepExplain(session=self.sess) as de:
-
             x_input = [self.input_p, self.input_p_len, self.input_h, self.input_h_len, self.dropout_keep_prob]
             xi = [p, p_len, h, h_len, 1.0]
             yi = expand_y(y)
@@ -1391,45 +1926,49 @@ class Manager:
 
                 f.write("<html>")
                 f.write("<div><span>Prediction={} , Truth={}</span><br>\n".format(pred_label, true_label))
-                f.write("<p>Premise</p>\n")
+                f.write("<table style=\"border:1px solid\">")
+
+                f.write("<tr>")
+                f.write("<td><b>Premise<b></td>\n")
                 print("")
                 print("premise: ")
                 r_max = max([np.max(E_sum[label][s]) for label in range(3) for s in range(0,1)])
                 r_min = min([np.min(E_sum[label][s]) for label in range(3) for s in range(0,1)])
-                ce_max = max(np.max(p_c_e_s), -np.min(p_c_e_s))
-                ce_min = -ce_max
-                for j in range(max_seq):
-                    print("{0}({1:.2f},{2:.2f})".format(word(p[i,j]), p_r_s[j], p_c_e_s[j]), end=" ")
-                    #f.write(print_color_html(word(p[i,j]), E_sum[0][0][j], E_sum[1][0][j], E_sum[2][0][j], r_max, r_min))
-                    v = p_c_e_s[j]
-                    if v > 0:
-                        r = v
-                        b = 0
-                    else:
-                        r = 0
-                        b = -v
-                    f.write(print_color_html(word(p[i,j]), r, b, 0, ce_max, ce_min))
+                ce_max = np.max(p_c_e_s)
+                ce_min = np.min(p_c_e_s)
 
+                def normalize(val):
+                    v = (val - ce_min) / (ce_max - ce_min) * 255
+                    assert (v < 256 and v >= 0)
+                    return int(v)
+
+
+                for j in range(max_seq):
+                    raw_word = word(p[i,j])
+                    if raw_word == "PADDING":
+                        break
+                    print("{0}({1:.2f},{2:.2f})".format(raw_word, p_r_s[j], p_c_e_s[j]), end=" ")
+                    #f.write(print_color_html(word(p[i,j]), E_sum[0][0][j], E_sum[1][0][j], E_sum[2][0][j], r_max, r_min))
+                    f.write(print_color_html(raw_word, normalize(p_c_e_s[j])))
+                f.write("</tr>")
                 print()
                 _, max_seq, _ = h_r.shape
-                f.write("<br><p>Hypothesis</p>\n")
+                f.write("<tr>")
+                f.write("<td><b>Hypothesis<b></td>\n")
                 print("hypothesis: ")
                 r_max = max([np.max(E_sum[label][s]) for label in range(3) for s in range(1, 2)])
                 r_min = min([np.min(E_sum[label][s]) for label in range(3) for s in range(1, 2)])
                 ce_max = max(np.max(h_c_e_s), -np.min(h_c_e_s))
                 ce_min = -ce_max
                 for j in range(max_seq):
-                    print("{0}({1:.2f},{2:.2f})".format(word(h[i,j]), h_r_s[j], h_c_e_s[j]), end=" ")
+                    raw_word = word(h[i, j])
+                    if raw_word == "PADDING":
+                        break
+                    print("{0}({1:.2f},{2:.2f})".format(raw_word, h_r_s[j], h_c_e_s[j]), end=" ")
                     #f.write(print_color_html(word(h[i,j]), E_sum[0][1][j], E_sum[1][1][j], E_sum[2][1][j], r_max, r_min))
-                    v = h_c_e_s[j]
-                    if v > 0:
-                        r = v
-                        b = 0
-                    else:
-                        r = 0
-                        b = -v
-                    f.write(print_color_html(word(h[i,j]), r, b, 0, ce_max, ce_min))
+                    f.write(print_color_html(raw_word, normalize(h_c_e_s[j])))
                 print()
+                f.write("</tr></table>")
                 f.write("</div><hr>")
             f.write("</html>")
 

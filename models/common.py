@@ -255,7 +255,7 @@ def cartesian(v1, v2):
 def factorization_machine(input, input_size, name):
     # input : [ -1, input_size]
     hidden_dim = args.fm_latent
-    with tf.variable_scope(name):
+    with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
         L = tf.reshape(dense(input, input_size, 1, "w"), [-1]) # [batch*seq]
 
         v = tf.get_variable(
@@ -272,7 +272,7 @@ def factorization_machine(input, input_size, name):
 
 
 def LSTM_pool(input, max_seq, input_len, dim, dropout_keep_prob, name):
-    with tf.variable_scope(name):
+    with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
         lstm_cell = tf.contrib.rnn.LSTMBlockFusedCell(num_units=dim)
 
 

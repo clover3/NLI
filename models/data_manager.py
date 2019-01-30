@@ -1,6 +1,7 @@
 import json
 import random
 import re
+import csv
 
 LABEL_MAP = {
     "entailment": 0,
@@ -91,3 +92,23 @@ def worker(shared_content, dataset):
         # print(shared_content)
 
 
+def load_nli_explain(path):
+    f = open(path, "r")
+    reader = csv.reader(f, delimiter=',')
+
+    for idx, row in enumerate(reader):
+        if idx ==0 : continue
+        premise = row[0]
+        hypothesis= row[1]
+        tokens_premise = row[2].split()
+        tokens_hypothesis= row[3].split()
+
+        for t in tokens_hypothesis:
+            if t.lower() not in hypothesis.lower():
+                raise Exception(t)
+        for t in tokens_premise:
+            if t.lower() not in premise.lower():
+                print(premise)
+                raise Exception(t)
+
+        yield premise, hypothesis, tokens_premise, tokens_hypothesis

@@ -1,7 +1,7 @@
 from models.common import *
 
 
-def cafe_network(input_p, input_h, input_p_len, input_h_len, batch_size, num_classes, embedding, emb_size, max_seq, dropout_keep_prob):
+def cafe_network(input_p_emb, input_h_emb, input_p_len, input_h_len, batch_size, num_classes, embedding, emb_size, max_seq, dropout_keep_prob):
     print("CAFE network..")
     highway_size = emb_size
     with tf.device('/cpu:0'):
@@ -15,9 +15,9 @@ def cafe_network(input_p, input_h, input_p_len, input_h_len, batch_size, num_cla
         h2 = highway_layer(h1, out_size, out_size, activation, "{}/high2".format(name))
         return tf.reshape(h2, [-1, seq_len, out_size])
 
-    def encode(sent, s_len, name):
-        embedded_raw = tf.nn.embedding_lookup(embedding, sent, name=name)  # [batch, max_seq, dim]
+    def encode(embedded_raw, s_len, name):
         embedded = tf.reshape(embedded_raw, [-1, emb_size])
+        #dummy = tf.reshape(embedded, [-1, emb_size], name)
         h = highway_layer(embedded, emb_size, tf.nn.relu, "{}/high1".format(name))
         h2 = highway_layer(h, emb_size, tf.nn.relu, "{}/high2".format(name))
         h2_drop = tf.nn.dropout(h2, dropout_keep_prob)
@@ -42,11 +42,11 @@ def cafe_network(input_p, input_h, input_p_len, input_h_len, batch_size, num_cla
         return tf.stack([v_1, v_2, v_3], axis=2)
 
     with tf.device('/gpu:0'):
-        p_enc1, p_intra_att = encode(input_p[:, :p_len], p_len, "premise")  # [batch, s_len, dim*2]
+        p_enc1, p_intra_att = encode(input_p_emb[:, :p_len, :], p_len, "premise")  # [batch, s_len, dim*2]
         p_intra = align_fm(p_enc1, p_intra_att, input_p_len, "premise_intra") # [batch, s_len, 3]
 
     with tf.device('/gpu:0'):
-        h_enc1, h_intra_att = encode(input_h[:, :h_len], h_len, "hypothesis")
+        h_enc1, h_intra_att = encode(input_h_emb[:, :h_len, :], h_len, "hypothesis")
         h_intra = align_fm(h_enc1, h_intra_att, input_h_len, "hypothesis_intra")
 
         alpha, beta = inter_attention(p_enc1, h_enc1, "inter_attention")
